@@ -5,14 +5,16 @@ import os
 import jax
 import jax.numpy as jnp
 import optax
+import tensorflow as tf
 import tiktoken
 from model import GPT, get_config, load_hf_pretrained
 from utils import compute_flops
 
-lead_host = jax.process_index() == 0
 if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
   jax.distributed.initialize()
+lead_host = jax.process_index() == 0
 print("Hello from process", jax.process_index())
+
 
 def info(*a, **k):
   if lead_host:
@@ -29,20 +31,22 @@ def sample(model, params, tokens, rng: jnp.ndarray):
   next_token = jnp.take(topk_indices, idx)
   return next_token
 
+
 def main():
   info("Total devices:", jax.device_count())
   rng = jax.random.PRNGKey(42)
 
   # Initialize model.
   variant = "gpt2"
-  config = get_config(variant)
-  model = GPT(config)
+  cfg = get_config(variant)
+  model = GPT(cfg)
   rng, rng_init = jax.random.split(rng)
 
   def init(rng):
-    dummy_input = jnp.ones((1, config.block_size), dtype=jnp.int32)
+    dummy_input = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
     params = jax.jit(model.init, backend="cpu")(rng, dummy_input)["params"]
-    gflops = compute_flops(functools.partial(model.apply, {"params": params}), [dummy_input]) / 1e9
+    gflops = compute_flops(
+        functools.partial(model.apply, {"params": params}), [dummy_input]) / 1e9
     return params, gflops
 
   params, gflops = init(rng_init)
