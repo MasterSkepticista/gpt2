@@ -4,3 +4,4 @@ clu
 optax
 einops
 tiktoken
+tensorflow-cpu

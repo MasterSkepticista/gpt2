@@ -12,28 +12,25 @@ from utils import compute_flops
 lead_host = jax.process_index() == 0
 if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
   jax.distributed.initialize()
-
+print("Hello from process", jax.process_index())
 
 def info(*a, **k):
   if lead_host:
     print(*a, **k)
 
-def get_sampling_fn(model, params):
-
-  def _sampling_fn(tokens, rng: jnp.ndarray):
-    """Samples next token."""
-    bs = tokens.shape[0]
-    logits = model.apply({"params": params}, tokens)
-    logits = logits[:, -1, :]
-    topk_logits, topk_indices = jax.lax.top_k(logits, k=50)
-    idx = jax.random.categorical(rng, topk_logits, axis=-1, shape=(bs, 1))
-    next_token = jnp.take(topk_indices, idx)
-    return next_token
-
-  return _sampling_fn
+# @jax.jit
+def sample(model, params, tokens, rng: jnp.ndarray):
+  """Samples next token."""
+  bs = tokens.shape[0]
+  logits = model.apply({"params": params}, tokens)
+  logits = logits[:, -1, :]
+  topk_logits, topk_indices = jax.lax.top_k(logits, k=50)
+  idx = jax.random.categorical(rng, topk_logits, axis=-1, shape=(bs, 1))
+  next_token = jnp.take(topk_indices, idx)
+  return next_token
 
 def main():
-  print(jax.local_devices())
+  info("Total devices:", jax.device_count())
   rng = jax.random.PRNGKey(42)
 
   # Initialize model.
@@ -58,12 +55,11 @@ def main():
   tokenizer = tiktoken.get_encoding("gpt2")
   prompt = "Hello, I am a language model,"
   tokens = jnp.array([tokenizer.encode(prompt)])[:, :config.block_size]
-  sampling_fn = get_sampling_fn(model, params)
   info(prompt, end="")
   while True:
     # Generate next token.
     rng, rng_sample = jax.random.split(rng)
-    next_token = sampling_fn(tokens, rng_sample)
+    next_token = sample(model, params, tokens, rng_sample)
     if next_token[0] == tokenizer.eot_token:
       break
     tokens = jnp.concat([tokens, next_token], axis=-1)
