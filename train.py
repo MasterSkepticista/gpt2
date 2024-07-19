@@ -20,6 +20,34 @@ def info(*a, **k):
   if lead_host:
     print(*a, **k)
 
+
+def build_pipeline(data_dir: str,
+                   batch_size: int,
+                   block_size: int,
+                   train: bool = False):
+  """Builds tf.data pipeline."""
+  
+  split = "train" if train else "val"
+  ds = tf.data.Dataset.list_files(os.path.join(data_dir, f"{split}_*.tfrecord"))
+  
+  ds = ds.shard(jax.device_count(), jax.process_index())
+  ds = ds.interleave(tf.data.TFRecordDataset, cycle_length=4, num_parallel_calls=tf.data.AUTOTUNE)
+  ds = ds.repeat()
+  ds = ds.shuffle(10_000)
+
+  def _preprocess(proto):
+    ex = tf.io.parse_single_example(proto, {"tokens": tf.io.FixedLenFeature([], tf.string)})
+    return tf.io.decode_raw(ex["tokens"], tf.uint16)
+
+  ds = ds.map(_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+  ds = ds.unbatch()  # Flattens to a stream of tokens.
+  ds = ds.batch(block_size + 1, drop_remainder=True)
+  ds = ds.map(lambda x: (x[:-1], x[1:]))  # Input and Next (completion) pairs.
+  ds = ds.batch(batch_size, drop_remainder=True)
+
+  ds = ds.prefetch(tf.data.AUTOTUNE)
+  return ds
+
 # @jax.jit
 def sample(model, params, tokens, rng: jnp.ndarray):
   """Samples next token."""
@@ -56,21 +84,25 @@ def main():
   params = load_hf_pretrained(variant)
 
   # Sample few tokens.
-  tokenizer = tiktoken.get_encoding("gpt2")
-  prompt = "Hello, I am a language model,"
-  tokens = jnp.array([tokenizer.encode(prompt)])[:, :config.block_size]
-  info(prompt, end="")
-  while True:
-    # Generate next token.
-    rng, rng_sample = jax.random.split(rng)
-    next_token = sample(model, params, tokens, rng_sample)
-    if next_token[0] == tokenizer.eot_token:
-      break
-    tokens = jnp.concat([tokens, next_token], axis=-1)
-    if tokens.shape[-1] > config.block_size:
-      tokens = tokens[:, -config.block_size:]
-    info(tokenizer.decode(next_token[0]), end="")
+  if False:
+    tokenizer = tiktoken.get_encoding("gpt2")
+    prompt = "Hello, I am a language model,"
+    tokens = jnp.array([tokenizer.encode(prompt)])[:, :config.block_size]
+    info(prompt, end="")
+    while True:
+      # Generate next token.
+      rng, rng_sample = jax.random.split(rng)
+      next_token = sample(model, params, tokens, rng_sample)
+      if next_token[0] == tokenizer.eot_token:
+        break
+      tokens = jnp.concat([tokens, next_token], axis=-1)
+      if tokens.shape[-1] > config.block_size:
+        tokens = tokens[:, -config.block_size:]
+      info(tokenizer.decode(next_token[0]), end="")
 
+  # Build data pipeline.
+  train_ds = build_pipeline("data", batch_size=32, block_size=cfg.block_size, train=True)
+  val_ds = build_pipeline("data", batch_size=32, block_size=cfg.block_size, train=False)
 
 if __name__ == "__main__":
   main()
