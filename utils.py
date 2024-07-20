@@ -1,9 +1,11 @@
 """Utils."""
 import collections
-from typing import Any, Callable
+from typing import Any, Callable, List
 
 import jax
 import jax.numpy as jnp
+from absl import logging
+from clu import metric_writers
 
 PyTree = Any
 
@@ -47,7 +49,6 @@ def shard_batches(batch: PyTree, num_devices: int = None) -> PyTree:
                       batch)
 
 
-@jax.jit
 def get_cosine_lr_schedule(max_lr: float, min_lr: float, max_steps: int,
                            warmup_steps: int) -> Callable[[int], float]:
   """Cosine learning rate schedule.
@@ -63,12 +64,41 @@ def get_cosine_lr_schedule(max_lr: float, min_lr: float, max_steps: int,
   """
 
   def sched_fn(step: int) -> float:
-    if step < warmup_steps:
-      return max_lr * step / warmup_steps
-    if step > max_steps:
-      return min_lr
     decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1.0
-    return min_lr + (max_lr - min_lr) * 0.5 * (1 + jnp.cos(decay_ratio * jnp.pi))
+    decay_ratio = jnp.clip(decay_ratio, 0.0, 1.0)
+    lr = min_lr + (max_lr - min_lr) * 0.5 * (1 + jnp.cos(decay_ratio * jnp.pi))
+    lr = jnp.minimum(lr, max_lr * step / warmup_steps)
+    return lr
 
   return sched_fn
+
+
+def log_summary(step: int,
+                metrics: List[dict],
+                extra_logs: dict,
+                writer: metric_writers.MetricWriter = None,
+                prefix: str = "train"):
+  """Logs train summary and optionally writes summaries.
+  
+  Args:
+    metrics: A list of metric dictionaries collected over steps.
+    writer: Optional metric writer to write summaries to a file.
+  """
+  # Transpose: list of dicts to dict of lists.
+  metrics = jax.tree.map(lambda *vals: jnp.stack(vals), *metrics)
+  
+  # Log only on main host.
+  if jax.process_index() == 0:
+    summaries = extra_logs
+    summaries.update({
+        "/".join((prefix, key)): val.mean()
+        for key, val in metrics.items()
+    })
+
+    # Log to stdout
+    for name, value in summaries.items():
+      logging.info(f"\u001b[35m[{step}]\u001b[0m {name}={float(value):.5f}")
+
+    if writer is not None:
+      writer.write_scalars(step, summaries)
+      writer.flush()
