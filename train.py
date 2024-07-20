@@ -9,7 +9,7 @@ import optax
 import tensorflow as tf
 import tiktoken
 import utils as u
-from absl import app, logging, flags
+from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
 from flax import jax_utils, struct
 from model import GPT, get_config, load_hf_pretrained
@@ -41,15 +41,12 @@ def build_pipeline(data_dir: str,
 
   split = "train" if train else "val"
   ds = tf.data.Dataset.list_files(os.path.join(data_dir, f"{split}_*.tfrecord"))
-  ds = ds.shard(jax.device_count(), jax.process_index())
 
   if train:
     ds = ds.shuffle(256)  # At shards-level.
 
-  ds = ds.interleave(
-      tf.data.TFRecordDataset,
-      cycle_length=4,
-      num_parallel_calls=tf.data.AUTOTUNE)
+  ds = tf.data.TFRecordDataset(ds)
+  ds = ds.shard(jax.process_count(), jax.process_index())
   ds = ds.repeat()
   
   if train:
@@ -86,20 +83,25 @@ def sample(model, params, tokens, rng: jnp.ndarray):
   next_token = jnp.take(topk_indices, idx)
   return next_token
 
-def get_train_step(model: Any):
+def get_train_step(model: Any, grad_accum_steps: int):
   """Returns a fn that executes one step of training."""
 
   def train_step(state: TrainState, batch: PyTree) -> Tuple[TrainState, PyTree]:
     """Single update step."""
     measurements = {}
-    def loss_fn(params):
+
+    def loss_fn(params, batch):
       x, y = batch
       logits = model.apply({"params": params}, x)
       loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
       return loss.mean()
 
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    # Compute local gradient.
+    grad_fn = jax.value_and_grad(loss_fn)
+    loss, grads = u.accumulate_gradient(grad_fn, state.params, batch, grad_accum_steps)
     grads = jax.lax.pmean(grads, axis_name="batch")
+
+    # Compute and apply updates.
     updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
 
