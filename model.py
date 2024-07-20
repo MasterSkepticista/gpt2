@@ -1,10 +1,12 @@
 """Model definition for GPT-2."""
 from dataclasses import dataclass
+
 import einops
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from utils import recover_tree
+
 
 @dataclass
 class GPTConfig:
@@ -116,15 +118,17 @@ class GPT(nn.Module):
     x = wte.attend(x)
     return x
 
+
 def get_config(variant: str):
   assert variant in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
   config_args = {
-    "gpt2": {"emb_dim": 768, "num_heads": 12, "num_layers": 12},
-    "gpt2-medium": {"emb_dim": 1024, "num_heads": 16, "num_layers": 24},
-    "gpt2-large": {"emb_dim": 1280, "num_heads": 20, "num_layers": 36},
-    "gpt2-xl": {"emb_dim": 1600, "num_heads": 25, "num_layers": 48},
+      "gpt2": dict(num_layers=12, num_heads=12, emb_dim=768),  # 124M
+      "gpt2-medium": dict(num_layers=24, num_heads=16, emb_dim=1024),  # 350M
+      "gpt2-large": dict(num_layers=36, num_heads=20, emb_dim=1280),  # 774M
+      "gpt2-xl": dict(num_layers=48, num_heads=25, emb_dim=1600),  # 1558M
   }[variant]
   return GPTConfig(**config_args)
+
 
 def load_hf_pretrained(variant: str):
   """Load HF-Transformers GPT2 weights."""
@@ -137,9 +141,16 @@ def load_hf_pretrained(variant: str):
 
   # Rename torch params to flax params.
   hf_params = {k.replace("transformer.", ""): v for k, v in hf_params.items()}
-  hf_params = {k.replace("wte.weight", "wte.embedding"): v for k, v in hf_params.items()}
-  hf_params = {k.replace("wpe.weight", "wpe.embedding"): v for k, v in hf_params.items()}
-  hf_params = {(k.replace(".weight", ".scale") if "ln" in k else k): v for k, v in hf_params.items()}
+  hf_params = {
+      k.replace("wte.weight", "wte.embedding"): v for k, v in hf_params.items()
+  }
+  hf_params = {
+      k.replace("wpe.weight", "wpe.embedding"): v for k, v in hf_params.items()
+  }
+  hf_params = {
+      (k.replace(".weight", ".scale") if "ln" in k else k): v
+      for k, v in hf_params.items()
+  }
   hf_params = {k.replace(".weight", ".kernel"): v for k, v in hf_params.items()}
   hf_params.pop("lm_head.kernel")  # Same as wte.embedding
 
