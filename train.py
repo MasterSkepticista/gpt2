@@ -1,38 +1,52 @@
 """Trains GPT-2."""
 import functools
 import os
+from typing import Any, Tuple
 
 import jax
-from flax import jax_utils
 import jax.numpy as jnp
 import optax
 import tensorflow as tf
 import tiktoken
-from model import GPT, get_config, load_hf_pretrained
 import utils as u
+from absl import app, logging, flags
+from clu import metric_writers, periodic_actions
+from flax import jax_utils, struct
+from model import GPT, get_config, load_hf_pretrained
 
-if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
-  jax.distributed.initialize()
-lead_host = jax.process_index() == 0
-print("Hello from process", jax.process_index())
+logging.set_verbosity("info")
 
+flags.DEFINE_string("workdir", 
+                    default=None, 
+                    required=True, 
+                    help="Path to store logs/checkpoints.")
+flags.mark_flags_as_required(["workdir"])
+FLAGS = flags.FLAGS
 
-def info(*a, **k):
-  if lead_host:
-    print(*a, **k)
+PyTree = Any
 
+@struct.dataclass
+class TrainState:
+  """Simple container to hold training state."""
+  params: PyTree
+  opt_state: PyTree
+  global_step: int
+  tx: optax.GradientTransformation = struct.field(pytree_node=False)
 
 def build_pipeline(data_dir: str,
                    batch_size: int,
                    block_size: int,
                    train: bool = False):
   """Builds tf.data pipeline."""
-  
+
   split = "train" if train else "val"
   ds = tf.data.Dataset.list_files(os.path.join(data_dir, f"{split}_*.tfrecord"))
-  
+
   ds = ds.shard(jax.device_count(), jax.process_index())
-  ds = ds.interleave(tf.data.TFRecordDataset, cycle_length=4, num_parallel_calls=tf.data.AUTOTUNE)
+  ds = ds.interleave(
+      tf.data.TFRecordDataset,
+      cycle_length=4,
+      num_parallel_calls=tf.data.AUTOTUNE)
   ds = ds.repeat()
   ds = ds.shuffle(10_000)
 
@@ -55,6 +69,7 @@ def build_pipeline(data_dir: str,
   ds = jax_utils.prefetch_to_device(ds, 2)
   return ds
 
+
 # @jax.jit
 def sample(model, params, tokens, rng: jnp.ndarray):
   """Samples next token."""
@@ -66,9 +81,52 @@ def sample(model, params, tokens, rng: jnp.ndarray):
   next_token = jnp.take(topk_indices, idx)
   return next_token
 
+def get_train_step(model: Any):
+  """Returns a fn that executes one step of training."""
 
-def main():
-  info("Total devices:", jax.device_count())
+  def train_step(state: TrainState, batch: PyTree) -> Tuple[TrainState, PyTree]:
+    """Single update step."""
+    measurements = {}
+    def loss_fn(params):
+      x, y = batch
+      logits = model.apply({"params": params}, x)
+      loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+      return loss.mean()
+
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
+    new_params = optax.apply_updates(state.params, updates)
+
+    # Update state.
+    new_state = state.replace(
+      params=new_params,
+      opt_state=new_opt_state,
+      global_step=state.global_step + 1)
+
+    # Metrics.
+    measurements["loss"] = loss
+    gs = jax.tree.leaves(grads)
+    measurements["l2_grads"] = jnp.sqrt(sum(jnp.vdot(g, g) for g in gs))
+    us = jax.tree.leaves(updates)
+    measurements["l2_updates"] = jnp.sqrt(sum(jnp.vdot(u, u) for u in us))
+    ps = jax.tree.leaves(new_params)
+    measurements["l2_params"] = jnp.sqrt(sum(jnp.vdot(p, p) for p in ps))
+    return new_state, measurements
+
+  return train_step
+
+def main(unused_argv):
+  if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
+    jax.distributed.initialize()
+  lead_host = jax.process_index() == 0
+  logging.info("Hello from process %d holding %d device(s)", jax.process_index(), jax.local_device_count())
+
+  def info(s, *a):
+    if lead_host:
+      logging.info("\u001b[32mNOTE\u001b[0m: " + s, *a)
+
+  info("Total devices: %d", jax.device_count())
   rng = jax.random.PRNGKey(42)
 
   # Initialize model.
@@ -85,10 +143,7 @@ def main():
     return params, gflops
 
   params, gflops = init(rng_init)
-  info("GFLOPs:", gflops)
-
-  # Load GPT2 pretrained weights.
-  params = load_hf_pretrained(variant)
+  info(f"GFLOPs for model {variant}: {gflops:.4f}")
 
   # Sample few tokens.
   if False:
@@ -108,8 +163,13 @@ def main():
       info(tokenizer.decode(next_token[0]), end="")
 
   # Build data pipeline.
-  train_iter = build_pipeline("data", batch_size=32, block_size=cfg.block_size, train=True)
-  val_iter = build_pipeline("data", batch_size=32, block_size=cfg.block_size, train=False)
+  tokens_per_batch = int(2**17)  # 0.5M
+  assert tokens_per_batch % cfg.block_size == 0
+  batch_size = tokens_per_batch // cfg.block_size
+  info("Number of tokens per batch (globally): %d", tokens_per_batch)
+  info("Per-device batch size: %d", batch_size)
+  train_iter = build_pipeline("data", batch_size, cfg.block_size, train=True)
+  val_iter = build_pipeline("data", batch_size, cfg.block_size, train=False)
 
   # Build optimizer and train state.
   max_lr = 6e-4
@@ -119,16 +179,48 @@ def main():
   sched_fn = u.get_cosine_lr_schedule(max_lr, min_lr, max_steps, warmup_steps)
 
   tx = optax.chain(
-    optax.clip_by_global_norm(1.0),
-    optax.adamw(
-      learning_rate=sched_fn, 
-      b1=0.9, 
-      b2=0.95,
-      weight_decay=0.1,
-      mask=jax.tree.map(lambda p: p.ndim > 1, params)),
-  )
+      optax.clip_by_global_norm(1.0),
+      optax.adamw(
+          sched_fn,
+          b1=0.9,
+          b2=0.95,
+          weight_decay=0.1,
+          mask=jax.tree.map(lambda p: p.ndim > 1, params)))
   opt_state = tx.init(params)
+
+  start_step = 0
+  state = TrainState(params, opt_state, start_step, tx)
+  state = jax_utils.replicate(state)
+  train_step = jax.pmap(get_train_step(model), axis_name="batch")
+  
+  # Logging setup.
+  log_summary_steps = 50
+  log_eval_steps = 500
+  writer = metric_writers.AsyncWriter(metric_writers.SummaryWriter(FLAGS.workdir))
+  progress = periodic_actions.ReportProgress(
+    num_train_steps=max_steps, writer=writer, every_steps=log_summary_steps)
+  hooks = []
+  if lead_host:
+    hooks.append(progress)
+
+  # Train loop.
+  train_metrics = []
+  info("Starting training at step %d", start_step + 1)
+  for step in range(start_step + 1, max_steps + 1):
+
+    train_batch = next(train_iter)
+    state, metrics = train_step(state, train_batch)
+    train_metrics.append(jax_utils.unreplicate(metrics))
+
+    for h in hooks:
+      h(step)
+
+    if step % log_summary_steps == 0:
+      extra_logs = {"global_schedule": sched_fn(step)}
+      u.log_summary(step, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
+      train_metrics = []
+      
 
 
 if __name__ == "__main__":
-  main()
+  app.run(main)
