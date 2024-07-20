@@ -41,14 +41,19 @@ def build_pipeline(data_dir: str,
 
   split = "train" if train else "val"
   ds = tf.data.Dataset.list_files(os.path.join(data_dir, f"{split}_*.tfrecord"))
-
   ds = ds.shard(jax.device_count(), jax.process_index())
+
+  if train:
+    ds = ds.shuffle(256)  # At shards-level.
+
   ds = ds.interleave(
       tf.data.TFRecordDataset,
       cycle_length=4,
       num_parallel_calls=tf.data.AUTOTUNE)
   ds = ds.repeat()
-  ds = ds.shuffle(10_000)
+  
+  if train:
+    ds = ds.shuffle(10_000)  # At documents-level.
 
   def _decode(proto):
     ex = tf.io.parse_single_example(proto, {"tokens": tf.io.FixedLenFeature([], tf.string)})
