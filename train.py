@@ -121,6 +121,17 @@ def get_train_step(model: Any):
 
   return train_step
 
+def get_eval_step(model: Any):
+  """Returns a fn that runs one step of eval."""
+
+  def eval_step(state: TrainState, batch: PyTree) -> dict:
+    x, y = batch
+    logits = model.apply({"params": state.params}, x)
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    return {"loss": loss.mean()}
+  
+  return eval_step
+
 def main(unused_argv):
   if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
     jax.distributed.initialize()
@@ -193,10 +204,12 @@ def main(unused_argv):
           mask=jax.tree.map(lambda p: p.ndim > 1, params)))
   opt_state = tx.init(params)
 
+  # Resume from checkpoint or start from scratch.
   start_step = 0
   state = TrainState(params, opt_state, start_step, tx)
   state = jax_utils.replicate(state)
   train_step = jax.pmap(get_train_step(model), axis_name="batch")
+  eval_step = jax.pmap(get_eval_step(model), axis_name="batch")
   
   # Logging setup.
   log_summary_steps = 50
@@ -213,6 +226,7 @@ def main(unused_argv):
   info("Starting training at step %d", start_step + 1)
   for step in range(start_step + 1, max_steps + 1):
 
+    # Train step.
     train_batch = next(train_iter)
     state, metrics = train_step(state, train_batch)
     train_metrics.append(jax_utils.unreplicate(metrics))
@@ -220,12 +234,21 @@ def main(unused_argv):
     for h in hooks:
       h(step)
 
+    # Log train stats.
     if step % log_summary_steps == 0:
       extra_logs = {"global_schedule": sched_fn(step)}
       u.log_summary(step, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
       train_metrics = []
-      
-
+    
+    # Evaluate and store checkpoints.
+    if step % log_eval_steps == 0:
+      info("Running eval")
+      with progress.timed("eval"):
+        eval_metrics = []
+        for _ in range(20):
+          eval_batch = next(val_iter)
+          eval_metrics.append(jax_utils.unreplicate(eval_step(state, eval_batch)))
+        u.log_summary(step, eval_metrics, writer=writer, prefix="val")
 
 if __name__ == "__main__":
   app.run(main)
