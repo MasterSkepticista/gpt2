@@ -75,14 +75,20 @@ def get_cosine_lr_schedule(max_lr: float, min_lr: float, max_steps: int,
 
 def log_summary(step: int,
                 metrics: List[dict],
-                extra_logs: dict,
+                extra_logs: dict = {},
                 writer: metric_writers.MetricWriter = None,
                 prefix: str = "train"):
   """Logs train summary and optionally writes summaries.
   
   Args:
+    step: Integer, current step.
     metrics: A list of metric dictionaries collected over steps.
+    extra_logs: A dict of addl. logs (e.g. learning rates).
     writer: Optional metric writer to write summaries to a file.
+    prefix: Prefix to be applied on metric keys.
+  
+  Returns:
+    Nothing.
   """
   # Transpose: list of dicts to dict of lists.
   metrics = jax.tree.map(lambda *vals: jnp.stack(vals), *metrics)
