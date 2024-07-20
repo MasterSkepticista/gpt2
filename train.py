@@ -150,7 +150,8 @@ def main(unused_argv):
   # Initialize model.
   variant = "gpt2"
   cfg = get_config(variant)
-  model = GPT(cfg)
+  info("Config: %s", cfg)
+  model = GPT(cfg, dtype=jnp.bfloat16)
   rng, rng_init = jax.random.split(rng)
 
   def init(rng):
@@ -181,13 +182,13 @@ def main(unused_argv):
       info(tokenizer.decode(next_token[0]), end="")
 
   # Build data pipeline.
-  tokens_per_batch = int(2**17)  # 0.5M
-  assert tokens_per_batch % cfg.block_size == 0
-  batch_size = tokens_per_batch // cfg.block_size
-  info("Number of tokens per batch (globally): %d", tokens_per_batch)
-  info("Per-device batch size: %d", batch_size)
-  train_iter = build_pipeline("data", batch_size, cfg.block_size, train=True)
-  val_iter = build_pipeline("data", batch_size, cfg.block_size, train=False)
+  batch_size = 512  # corresponds to 0.5M tokens at block_size=1024
+  grad_accum_steps = 4
+  local_batch_size = batch_size // jax.process_count()
+  info("Global batch size: %d (%d tokens per batch)", batch_size, batch_size * cfg.block_size)
+  info("Local batch size: %d", local_batch_size)
+  train_iter = build_pipeline("data", local_batch_size, cfg.block_size, train=True)
+  val_iter = build_pipeline("data", local_batch_size, cfg.block_size, train=False)
 
   # Build optimizer and train state.
   max_lr = 6e-4
@@ -210,12 +211,12 @@ def main(unused_argv):
   start_step = 0
   state = TrainState(params, opt_state, start_step, tx)
   state = jax_utils.replicate(state)
-  train_step = jax.pmap(get_train_step(model), axis_name="batch")
+  train_step = jax.pmap(get_train_step(model, grad_accum_steps), axis_name="batch")
   eval_step = jax.pmap(get_eval_step(model), axis_name="batch")
   
   # Logging setup.
-  log_summary_steps = 50
-  log_eval_steps = 500
+  log_summary_steps = 10
+  log_eval_steps = 50
   writer = metric_writers.AsyncWriter(metric_writers.SummaryWriter(FLAGS.workdir))
   progress = periodic_actions.ReportProgress(
     num_train_steps=max_steps, writer=writer, every_steps=log_summary_steps)
@@ -249,8 +250,11 @@ def main(unused_argv):
         eval_metrics = []
         for _ in range(20):
           eval_batch = next(val_iter)
-          eval_metrics.append(jax_utils.unreplicate(eval_step(state, eval_batch)))
+          metrics = eval_step(state, eval_batch)
+          eval_metrics.append(jax.device_get(jax_utils.unreplicate(metrics)))
         u.log_summary(step, eval_metrics, writer=writer, prefix="val")
+
+    writer.flush()
 
 if __name__ == "__main__":
   app.run(main)

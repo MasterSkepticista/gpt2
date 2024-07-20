@@ -1,6 +1,6 @@
 """Utils."""
 import collections
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -75,7 +75,7 @@ def get_cosine_lr_schedule(max_lr: float, min_lr: float, max_steps: int,
 
 def log_summary(step: int,
                 metrics: List[dict],
-                extra_logs: dict = {},
+                extra_logs: dict = None,
                 writer: metric_writers.MetricWriter = None,
                 prefix: str = "train"):
   """Logs train summary and optionally writes summaries.
@@ -92,13 +92,12 @@ def log_summary(step: int,
   """
   # Transpose: list of dicts to dict of lists.
   metrics = jax.tree.map(lambda *vals: jnp.stack(vals), *metrics)
-  
+
   # Log only on main host.
   if jax.process_index() == 0:
-    summaries = extra_logs
+    summaries = extra_logs or {}
     summaries.update({
-        "/".join((prefix, key)): val.mean()
-        for key, val in metrics.items()
+        "/".join((prefix, key)): val.mean() for key, val in metrics.items()
     })
 
     # Log to stdout
@@ -107,4 +106,46 @@ def log_summary(step: int,
 
     if writer is not None:
       writer.write_scalars(step, summaries)
-      writer.flush()
+
+
+def accumulate_gradient(value_and_grad_fn,
+                        params: PyTree,
+                        batch: PyTree,
+                        accum_steps: int = 1) -> Tuple[jnp.ndarray, PyTree]:
+  """Accumulates gradients over given steps.
+  
+  Args:
+    value_and_grad_fn: Gradient function that does not return aux values.
+    params: Parameters, passed as first argument to `value_and_grad_fn`.
+    batch: Batch, passed as second argument to `value_and_grad_fn`.
+    accum_steps: Number of micro batches to accumulate over. Defaults to 1,
+      which means no gradients are accumulated.
+  
+  Returns:
+    Tuple (loss, grads).
+  """
+  if accum_steps > 1:
+    bs = next(iter(jax.tree.leaves(batch))).shape[0]
+    assert bs % accum_steps == 0, (
+        f"Invalid accum_steps {accum_steps} for batch size `{bs}")
+    microbatch_size = bs // accum_steps
+    logging.info("Accumulating with microbatch_size %d over %d steps.",
+                 microbatch_size, accum_steps)
+
+    def get_microbatch(batch, i):
+      return jax.tree.map(
+          lambda t: jnp.reshape(t, (accum_steps, -1) + (t.shape[1:]))[i], batch)
+
+    # Initialize accumulator.
+    l, g = value_and_grad_fn(params, get_microbatch(batch, 0))
+
+    def accumulate(i, l_and_g):
+      l, g = l_and_g
+      l_i, g_i = value_and_grad_fn(params, get_microbatch(batch, i))
+      return (l + l_i, jax.tree.map(jnp.add, g, g_i))
+
+    # Average over accum_steps.
+    loss, grads = jax.lax.fori_loop(1, accum_steps, accumulate, (l, g))
+    return jax.tree.map(lambda x: x / accum_steps, (loss, grads))
+  else:
+    return value_and_grad_fn(params, batch)
