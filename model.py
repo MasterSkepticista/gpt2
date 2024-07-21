@@ -48,9 +48,9 @@ class MlpBlock(nn.Module):
   @nn.compact
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     out_dim = x.shape[-1]
-    x = nn.Dense(4 * out_dim, name="c_fc")(x)
+    x = nn.Dense(4 * out_dim, dtype=self.dtype, name="c_fc")(x)
     x = nn.gelu(x)
-    x = nn.Dense(out_dim, name="c_proj")(x)
+    x = nn.Dense(out_dim, dtype=self.dtype, name="c_proj")(x)
     return x
 
 
@@ -63,8 +63,8 @@ class Block(nn.Module):
   def __call__(self, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     attn = SelfAttention(self.num_heads, dtype=self.dtype, name="attn")
     mlp = MlpBlock(dtype=self.dtype, name="mlp")
-    x = x + attn(nn.LayerNorm(name="ln_1")(x), mask)
-    x = x + mlp(nn.LayerNorm(name="ln_2")(x))
+    x = x + attn(nn.LayerNorm(dtype=self.dtype, name="ln_1")(x), mask=mask)
+    x = x + mlp(nn.LayerNorm(dtype=self.dtype, name="ln_2")(x))
     return x
 
 
@@ -96,11 +96,13 @@ class GPT(nn.Module):
         self.cfg.vocab_size,
         features=self.cfg.emb_dim,
         embedding_init=nn.initializers.normal(stddev=0.02),
+        dtype=self.dtype,
         name="wte")
     wpe = nn.Embed(
         self.cfg.block_size,
         features=self.cfg.emb_dim,
         embedding_init=nn.initializers.normal(stddev=0.02),
+        dtype=self.dtype,
         name="wpe")
 
     tok_emb = wte(x)
@@ -110,11 +112,14 @@ class GPT(nn.Module):
 
     # Apply transformer blocks.
     x = Transformer(
-        self.cfg.emb_dim, self.cfg.num_heads, self.cfg.num_layers, name="h")(
-            x, mask=causal_mask)
+        self.cfg.emb_dim,
+        self.cfg.num_heads,
+        self.cfg.num_layers,
+        dtype=self.dtype,
+        name="h")(x, mask=causal_mask)
 
     # Final layer norm and classification.
-    x = nn.LayerNorm(name="ln_f")(x)
+    x = nn.LayerNorm(dtype=self.dtype, name="ln_f")(x)
     x = wte.attend(x)
     return x
 
