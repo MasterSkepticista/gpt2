@@ -5,9 +5,10 @@ This is a Jax/Flax reimplementation of GPT-2 family of models on FineWeb-Edu dat
 Updates:
 - [x] Add support for `tf.data` pipelines over TFRecords.
 - [x] Add support for `bfloat16` computation.
-- [ ] Use `cudnn_dot_product_attention`.
+- [x] SPMD (multi-node) training support using `pmap`.
 - [ ] Expose configurables via CLI flags.
-- [x] SPMD (multi-node) training support.
+- [ ] Use cuDNN flash attention kernel.
+- [ ] Add `shard_map` support for model and data sharding.
 
 ## Setup
 Create a virtual environment and install packages.
