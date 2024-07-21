@@ -9,7 +9,7 @@ Updates:
 - [ ] Expose configurables via CLI flags.
 - [x] SPMD (multi-node) training support.
 
-### Setup
+## Setup
 Create a virtual environment and install packages.
 ```shell
 $> pip install -r requirements.txt
@@ -20,12 +20,12 @@ For SPMD support (multi-node training), install OpenMPI.
 $> sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
 ```
 
-### Prepare `TFRecords`
+## Prepare `TFRecords`
 ```shell
 $> python fineweb.py --outdir /path/to/store/tfrecord
 ```
 
-### Train
+## Train
 ```shell
 # Single process, multi-GPU.
 $> python train.py --workdir artifacts/gpt2_124M
@@ -41,5 +41,5 @@ $> mpirun -n 8 \
           python train.py --workdir artifacts/gpt2_124M
 ```
 
-### License
+## License
 MIT
