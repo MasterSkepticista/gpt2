@@ -156,7 +156,7 @@ def main(unused_argv):
 
   def init(rng):
     dummy_input = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
-    params = jax.jit(model.init, backend="cpu")(rng, dummy_input)["params"]
+    params = jax.jit(model.init)(rng, dummy_input)["params"]
     gflops = u.compute_flops(
         functools.partial(model.apply, {"params": params}), [dummy_input]) / 1e9
     return params, gflops

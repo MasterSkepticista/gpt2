@@ -14,9 +14,11 @@ def compute_flops(apply_fn: Callable,
                   dummy_inputs: list,
                   fuse_multiply_add: bool = True) -> float:
   """Compute the number of FLOPs of a Flax model."""
-  analysis = jax.jit(
-      apply_fn, backend="cpu").lower(*dummy_inputs).cost_analysis()
-  flops = analysis["flops"]
+  analysis = jax.jit(apply_fn).lower(*dummy_inputs).cost_analysis()
+  # Not all JAX plugins return analysis.
+  # See: https://jax.readthedocs.io/en/latest/aot.html#debug-information-and-analyses-when-available
+  analysis = analysis or {}
+  flops = analysis.get("flops", 0)
   if fuse_multiply_add:
     flops = flops / 2
   return flops
