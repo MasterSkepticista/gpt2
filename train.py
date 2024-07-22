@@ -12,6 +12,7 @@ import utils as u
 from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
 from flax import jax_utils, struct
+from flax.training.checkpoints import save_checkpoint
 from model import GPT, get_config, load_hf_pretrained
 
 logging.set_verbosity("info")
@@ -157,8 +158,7 @@ def main(unused_argv):
   def init(rng):
     dummy_input = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
     params = jax.jit(model.init)(rng, dummy_input)["params"]
-    gflops = u.compute_flops(
-        functools.partial(model.apply, {"params": params}), [dummy_input]) / 1e9
+    gflops = u.compute_flops(model.apply, [{"params": params}, dummy_input]) / 1e9
     return params, gflops
 
   params, gflops = init(rng_init)
@@ -244,7 +244,7 @@ def main(unused_argv):
       train_metrics = []
     
     # Evaluate and store checkpoints.
-    if step % log_eval_steps == 0:
+    if step % log_eval_steps == 0 or step == max_steps:
       info("Running eval")
       with progress.timed("eval"):
         eval_metrics = []
@@ -253,6 +253,11 @@ def main(unused_argv):
           metrics = eval_step(state, eval_batch)
           eval_metrics.append(jax.device_get(jax_utils.unreplicate(metrics)))
         u.log_summary(step, eval_metrics, writer=writer, prefix="val")
+
+      with progress.timed("checkpoint"):
+        unrepl_state = jax.device_get(jax_utils.unreplicate(state))
+        if lead_host:
+          save_checkpoint(FLAGS.workdir, unrepl_state, step=step)
 
     writer.flush()
 
