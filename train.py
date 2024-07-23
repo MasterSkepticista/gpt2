@@ -11,8 +11,9 @@ import tiktoken
 import utils as u
 from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
-from flax import jax_utils, struct
+from flax import jax_utils
 from flax.training.checkpoints import save_checkpoint
+from flax.training.train_state import TrainState
 from ml_collections import config_flags
 from model import GPT, load_hf_pretrained
 
@@ -33,15 +34,6 @@ flags.mark_flags_as_required(["workdir", "config"])
 
 FLAGS = flags.FLAGS
 
-PyTree = Any
-
-@struct.dataclass
-class TrainState:
-  """Simple container to hold training state."""
-  params: PyTree
-  opt_state: PyTree
-  global_step: int
-  tx: optax.GradientTransformation = struct.field(pytree_node=False)
 
 def build_pipeline(data_dir: str,
                    batch_size: int,
@@ -93,16 +85,16 @@ def sample(model, params, tokens, rng: jnp.ndarray):
   next_token = jnp.take(topk_indices, idx)
   return next_token
 
-def get_train_step(model: Any, grad_accum_steps: int):
+def get_train_step(grad_accum_steps: int):
   """Returns a fn that executes one step of training."""
 
-  def train_step(state: TrainState, batch: PyTree) -> Tuple[TrainState, PyTree]:
+  def train_step(state: TrainState, batch: Any) -> Tuple[TrainState, dict]:
     """Single update step."""
     measurements = {}
 
     def loss_fn(params, batch):
       x, y = batch
-      logits = model.apply({"params": params}, x)
+      logits = state.apply_fn({"params": params}, x)
       # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
       # if logits are `bfloat16`.
       # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
@@ -110,39 +102,28 @@ def get_train_step(model: Any, grad_accum_steps: int):
       loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
       return loss.mean()
 
-    # Compute gradients.
+    # Compute gradients and apply updates.
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = u.accumulate_gradient(grad_fn, state.params, batch, grad_accum_steps)
     grads = jax.lax.pmean(grads, axis_name="batch")
-
-    # Apply updates.
-    updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
-    new_params = optax.apply_updates(state.params, updates)
-
-    # Update state.
-    new_state = state.replace(
-      params=new_params,
-      opt_state=new_opt_state,
-      global_step=state.global_step + 1)
+    new_state = state.apply_gradients(grads=grads)
 
     # Metrics.
     measurements["loss"] = loss
     gs = jax.tree.leaves(grads)
     measurements["l2_grads"] = jnp.sqrt(sum(jnp.vdot(g, g) for g in gs))
-    us = jax.tree.leaves(updates)
-    measurements["l2_updates"] = jnp.sqrt(sum(jnp.vdot(u, u) for u in us))
-    ps = jax.tree.leaves(new_params)
+    ps = jax.tree.leaves(new_state.params)
     measurements["l2_params"] = jnp.sqrt(sum(jnp.vdot(p, p) for p in ps))
     return new_state, measurements
 
   return train_step
 
-def get_eval_step(model: Any):
+def get_eval_step():
   """Returns a fn that runs one step of eval."""
 
-  def eval_step(state: TrainState, batch: PyTree) -> dict:
+  def eval_step(state: TrainState, batch: Any) -> dict:
     x, y = batch
-    logits = model.apply({"params": state.params}, x)
+    logits = state.apply_fn({"params": state.params}, x)
     # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
     # if logits are `bfloat16`.
     # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
@@ -214,19 +195,21 @@ def main(unused_argv):
       sched_fn, 
       **cfg.optax_kwargs, 
       mask=jax.tree.map(lambda p: p.ndim > 1, params)))
-  opt_state = tx.init(params)
 
   # Resume from checkpoint or start from scratch.
   start_step = 0
-  state = TrainState(params, opt_state, start_step, tx)
+  state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
   state = jax_utils.replicate(state)
-  train_step = jax.pmap(get_train_step(model, cfg.grad_accum_steps), axis_name="batch")
-  eval_step = jax.pmap(get_eval_step(model), axis_name="batch")
+  train_step = jax.pmap(get_train_step(cfg.grad_accum_steps), axis_name="batch")
+  eval_step = jax.pmap(get_eval_step(), axis_name="batch")
   
   # Logging setup.
   writer = metric_writers.AsyncWriter(metric_writers.SummaryWriter(FLAGS.workdir))
   progress = periodic_actions.ReportProgress(
-    num_train_steps=cfg.total_steps, writer=writer, every_steps=cfg.log_train_steps)
+    num_train_steps=cfg.total_steps, 
+    writer=writer, 
+    every_steps=cfg.log_train_steps, 
+    every_secs=None)
   profile = periodic_actions.Profile(
     logdir=FLAGS.workdir, num_profile_steps=5, every_secs=None)
   hooks = []
