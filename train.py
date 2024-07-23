@@ -13,17 +13,24 @@ from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
 from flax import jax_utils, struct
 from flax.training.checkpoints import save_checkpoint
-from model import GPT, get_config, load_hf_pretrained
+from ml_collections import config_flags
+from model import GPT, load_hf_pretrained
 
 logging.set_verbosity("info")
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
 flax.config.update("flax_use_orbax_checkpointing", False)
 
 flags.DEFINE_string("workdir", 
-                    default=None, 
-                    required=True, 
+                    default=None,
                     help="Path to store logs/checkpoints.")
-flags.mark_flags_as_required(["workdir"])
+
+config_flags.DEFINE_config_file("config", 
+                                default=None, 
+                                help_string="Training config.", 
+                                lock_config=True)
+
+flags.mark_flags_as_required(["workdir", "config"])
+
 FLAGS = flags.FLAGS
 
 PyTree = Any
@@ -160,20 +167,18 @@ def main(unused_argv):
   rng = jax.random.PRNGKey(42)
 
   # Initialize model.
-  variant = "gpt2"
-  cfg = get_config(variant)
-  info("Config: %s", cfg)
-  model = GPT(cfg, dtype=jnp.bfloat16)
+  cfg = FLAGS.config
+  model = GPT(**cfg.model)
   rng, rng_init = jax.random.split(rng)
 
   def init(rng):
-    dummy_input = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
+    dummy_input = jnp.ones((1, cfg.model.block_size), dtype=jnp.int32)
     params = jax.jit(model.init)(rng, dummy_input)["params"]
     gflops = u.compute_flops(model.apply, [{"params": params}, dummy_input]) / 1e9
     return params, gflops
 
   params, gflops = init(rng_init)
-  info(f"GFLOPs for model {variant}: {gflops:.4f}")
+  info(f"GFLOPs for model: {gflops:.4f}")
 
   # Sample few tokens.
   if False:
@@ -193,44 +198,35 @@ def main(unused_argv):
       info(tokenizer.decode(next_token[0]), end="")
 
   # Build data pipeline.
-  batch_size = 512  # corresponds to 0.5M tokens at block_size=1024
-  grad_accum_steps = 1
-  local_batch_size = batch_size // jax.process_count()
-  info("Global batch size: %d (%d tokens per batch)", batch_size, batch_size * cfg.block_size)
-  info("Local batch size: %d", local_batch_size)
-  train_iter = build_pipeline("data", local_batch_size, cfg.block_size, train=True)
-  val_iter = build_pipeline("data", local_batch_size, cfg.block_size, train=False)
+  local_batch_size = cfg.batch_size // jax.process_count()
+  info("Batch size: %d", cfg.batch_size)
+  info("Tokens per batch: %d", cfg.batch_size * cfg.model.block_size)
+  train_iter = build_pipeline("data", local_batch_size, cfg.model.block_size, train=True)
+  val_iter = build_pipeline("data", local_batch_size, cfg.model.block_size, train=False)
 
   # Build optimizer and train state.
-  max_lr = 6e-4
-  min_lr = 0.1 * max_lr
-  max_steps = 19073
-  warmup_steps = 715
-  sched_fn = u.get_cosine_lr_schedule(max_lr, min_lr, max_steps, warmup_steps)
+  sched_fn = u.get_cosine_lr_schedule(
+    cfg.lr, cfg.min_lr, cfg.total_steps, cfg.warmup_steps)
 
   tx = optax.chain(
-      optax.clip_by_global_norm(1.0),
-      optax.adamw(
-          sched_fn,
-          b1=0.9,
-          b2=0.95,
-          weight_decay=0.1,
-          mask=jax.tree.map(lambda p: p.ndim > 1, params)))
+    optax.clip_by_global_norm(cfg.grad_clip_norm),
+    getattr(optax, cfg.optax_name)(
+      sched_fn, 
+      **cfg.optax_kwargs, 
+      mask=jax.tree.map(lambda p: p.ndim > 1, params)))
   opt_state = tx.init(params)
 
   # Resume from checkpoint or start from scratch.
   start_step = 0
   state = TrainState(params, opt_state, start_step, tx)
   state = jax_utils.replicate(state)
-  train_step = jax.pmap(get_train_step(model, grad_accum_steps), axis_name="batch")
+  train_step = jax.pmap(get_train_step(model, cfg.grad_accum_steps), axis_name="batch")
   eval_step = jax.pmap(get_eval_step(model), axis_name="batch")
   
   # Logging setup.
-  log_summary_steps = 10
-  log_eval_steps = 500
   writer = metric_writers.AsyncWriter(metric_writers.SummaryWriter(FLAGS.workdir))
   progress = periodic_actions.ReportProgress(
-    num_train_steps=max_steps, writer=writer, every_steps=log_summary_steps)
+    num_train_steps=cfg.total_steps, writer=writer, every_steps=cfg.log_train_steps)
   profile = periodic_actions.Profile(
     logdir=FLAGS.workdir, num_profile_steps=5, every_secs=None)
   hooks = []
@@ -240,24 +236,24 @@ def main(unused_argv):
   # Train loop.
   train_metrics = []
   info("Starting training loop at step %d", start_step + 1)
-  for step in range(start_step + 1, max_steps + 1):
+  for step in range(start_step + 1, cfg.total_steps + 1):
 
     # Train step.
     train_batch = next(train_iter)
     state, metrics = train_step(state, train_batch)
-    train_metrics.append(u.unreplicate_and_get(state))
+    train_metrics.append(u.unreplicate_and_get(metrics))
 
     for h in hooks:
       h(step)
 
     # Log train stats.
-    if step % log_summary_steps == 0:
+    if step % cfg.log_train_steps == 0:
       extra_logs = {"global_schedule": sched_fn(step)}
       u.log_summary(step, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
       train_metrics = []
     
     # Evaluate and store checkpoints.
-    if step % log_eval_steps == 0 or step == max_steps:
+    if step % cfg.log_eval_steps == 0 or step == cfg.total_steps:
       info("Running eval")
       with progress.timed("eval"):
         eval_metrics = []

@@ -1,70 +1,124 @@
 """Model definition for GPT-2."""
-from dataclasses import dataclass
+import functools
+from typing import Any, Callable, Literal
 
-import einops
 import jax
 import jax.numpy as jnp
+from absl import flags
 from flax import linen as nn
 from utils import recover_tree
 
-
-@dataclass
-class GPTConfig:
-  vocab_size: int = 50257
-  block_size: int = 1024
-  emb_dim: int = 768
-  num_heads: int = 12
-  num_layers: int = 12
+flags.DEFINE_bool(
+    "flash_attention", default=True, help="Whether to use JAX SDPA kernel.")
+FLAGS = flags.FLAGS
 
 
 class SelfAttention(nn.Module):
+  """Multi-Headed Causal Self-Attention."""
   num_heads: int
-  dtype: jnp.dtype = jnp.float32
-
-  @nn.compact
-  def __call__(self, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    x = nn.Dense(3 * x.shape[-1], dtype=self.dtype, name="c_attn")(x)
-    q, k, v = jnp.split(x, 3, axis=-1)
-
-    # Partition heads.
-    q = einops.rearrange(q, "b t (h d) -> b h t d", h=self.num_heads)
-    k = einops.rearrange(k, "b t (h d) -> b h t d", h=self.num_heads)
-    v = einops.rearrange(v, "b t (h d) -> b h t d", h=self.num_heads)
-
-    scale = 1.0 / jnp.sqrt(k.shape[-1])
-    attn = (q @ k.transpose(0, 1, 3, 2)) * scale
-    attn = jnp.where(mask, attn, jnp.finfo(jnp.float32).min)
-    attn = jax.nn.softmax(attn, axis=-1)  # (b, h, t, t)
-
-    x = attn @ v  # (b, h, t, t) @ (b, h, t, d) -> (b, h, t, d)
-    x = einops.rearrange(x, "b h t d -> b t (h d)")
-    out = nn.Dense(x.shape[-1], dtype=self.dtype, name="c_proj")(x)
-    return out
-
-
-class MlpBlock(nn.Module):
+  implementation: Literal["xla", "cudnn"] = "xla"
+  kernel_init: Callable[..., Any] = nn.initializers.normal(0.02)
+  bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
 
   @nn.compact
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    assert x.ndim == 3, "Input must be of shape [batch, time, features]"
+    assert x.shape[-1] % self.num_heads == 0, (
+        f"Embedding dimension {x.shape[-1]} must be divisible by num_heads {self.num_heads}"
+    )
+
+    b, t, c = x.shape
+    head_dim = c // self.num_heads
+
+    dense = functools.partial(
+        nn.DenseGeneral,
+        features=(self.num_heads, head_dim),
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
+        dtype=self.dtype)
+
+    q, k, v = (dense(name=name)(x) for name in ("q", "k", "v"))
+
+    if FLAGS.flash_attention:
+      # Flash attention.
+      x = jax.nn.dot_product_attention(
+          q, k, v, is_causal=True, implementation=self.implementation)
+    else:
+      # Standard attention (for educational purposes).
+      mask = nn.make_causal_mask(jnp.zeros((b, t)))
+      scale = 1.0 / jnp.sqrt(c)
+      attn = jnp.einsum("...qhd,...khd->...hqk", q, k * scale)
+      attn = jnp.where(mask, attn, jnp.finfo(jnp.float32).min)
+      attn = jax.nn.softmax(attn, axis=-1)
+      x = jnp.einsum("...hqk,...khd->...qhd", attn, v)
+
+    x = jnp.reshape(x, (b, t, c))
+    out = nn.Dense(
+        features=c,
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
+        name="c_proj",
+        dtype=self.dtype)(x)  # yapf: disable
+    return out
+
+
+class MlpBlock(nn.Module):
+  """MLP block."""
+  kernel_init: Callable[..., Any] = nn.initializers.normal(0.02)
+  bias_init: Callable[..., Any] = nn.initializers.zeros
+  dtype: jnp.dtype = jnp.float32
+
+  @nn.compact
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    dense = functools.partial(
+        nn.Dense,
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
+        dtype=self.dtype)
     out_dim = x.shape[-1]
-    x = nn.Dense(4 * out_dim, dtype=self.dtype, name="c_fc")(x)
+
+    x = dense(4 * out_dim, name="c_fc")(x)
     x = nn.gelu(x)
-    x = nn.Dense(out_dim, dtype=self.dtype, name="c_proj")(x)
+    x = dense(
+        out_dim,
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
+        dtype=self.dtype,
+        name="c_proj")(x)  # yapf: disable
     return x
 
 
 class Block(nn.Module):
+  """Transformer block."""
   emb_dim: int
   num_heads: int
+  sdpa_implementation: Literal["xla", "cudnn"]
+  kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
+  bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
 
   @nn.compact
-  def __call__(self, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    attn = SelfAttention(self.num_heads, dtype=self.dtype, name="attn")
-    mlp = MlpBlock(dtype=self.dtype, name="mlp")
-    x = x + attn(nn.LayerNorm(dtype=self.dtype, name="ln_1")(x), mask=mask)
-    x = x + mlp(nn.LayerNorm(dtype=self.dtype, name="ln_2")(x))
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    attn = SelfAttention(
+        self.num_heads,
+        implementation=self.sdpa_implementation,
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
+        dtype=self.dtype,
+        name="attn")
+
+    mlp = MlpBlock(
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
+        dtype=self.dtype,
+        name="mlp")
+
+    ln_1 = nn.LayerNorm(dtype=self.dtype, name="ln_1")
+    ln_2 = nn.LayerNorm(dtype=self.dtype, name="ln_2")
+
+    x = x + attn(ln_1(x))
+    x = x + mlp(ln_2(x))
     return x
 
 
@@ -72,36 +126,55 @@ class Transformer(nn.Module):
   emb_dim: int
   num_heads: int
   num_layers: int
+  sdpa_implementation: Literal["xla", "cudnn"]
+  kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
+  bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
 
   @nn.compact
-  def __call__(self, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     for i in range(self.num_layers):
-      x = Block(self.emb_dim, self.num_heads, dtype=self.dtype, name=str(i))(x, mask)
+      x = Block(
+          self.emb_dim,
+          self.num_heads,
+          sdpa_implementation=self.sdpa_implementation,
+          kernel_init=self.kernel_init,
+          bias_init=self.bias_init,
+          dtype=self.dtype,
+          name=str(i))(x)  # yapf: disable
     return x
 
 
 class GPT(nn.Module):
-  cfg: GPTConfig
+  """GPT-2 architecture."""
+  vocab_size: int
+  block_size: int
+  emb_dim: int
+  num_heads: int
+  num_layers: int
+  sdpa_implementation: Literal["xla", "cudnn"] = "xla"
+  embedding_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
+  kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
+  bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
 
   @nn.compact
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     _, T = x.shape
-    assert T <= self.cfg.block_size, f"Input sequence length {T} is greater than block size {self.cfg.block_size}"
-
-    causal_mask = nn.make_causal_mask(x)
+    assert T <= self.block_size, (
+        f"Input sequence length {T} is greater than block size {self.block_size}"
+    )
 
     wte = nn.Embed(
-        self.cfg.vocab_size,
-        features=self.cfg.emb_dim,
-        embedding_init=nn.initializers.normal(stddev=0.02),
+        self.vocab_size,
+        features=self.emb_dim,
+        embedding_init=self.embedding_init,
         dtype=self.dtype,
         name="wte")
     wpe = nn.Embed(
-        self.cfg.block_size,
-        features=self.cfg.emb_dim,
-        embedding_init=nn.initializers.normal(stddev=0.02),
+        self.block_size,
+        features=self.emb_dim,
+        embedding_init=self.embedding_init,
         dtype=self.dtype,
         name="wpe")
 
@@ -112,11 +185,14 @@ class GPT(nn.Module):
 
     # Apply transformer blocks.
     x = Transformer(
-        self.cfg.emb_dim,
-        self.cfg.num_heads,
-        self.cfg.num_layers,
+        self.emb_dim,
+        self.num_heads,
+        self.num_layers,
+        sdpa_implementation=self.sdpa_implementation,
+        kernel_init=self.kernel_init,
+        bias_init=self.bias_init,
         dtype=self.dtype,
-        name="h")(x, mask=causal_mask)
+        name="h")(x)  # yapf: disable
 
     # Final layer norm and classification.
     x = nn.LayerNorm(dtype=self.dtype, name="ln_f")(x)
@@ -124,18 +200,8 @@ class GPT(nn.Module):
     return x
 
 
-def get_config(variant: str):
-  assert variant in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
-  config_args = {
-      "gpt2": dict(num_layers=12, num_heads=12, emb_dim=768),  # 124M
-      "gpt2-medium": dict(num_layers=24, num_heads=16, emb_dim=1024),  # 350M
-      "gpt2-large": dict(num_layers=36, num_heads=20, emb_dim=1280),  # 774M
-      "gpt2-xl": dict(num_layers=48, num_heads=25, emb_dim=1600),  # 1558M
-  }[variant]
-  return GPTConfig(**config_args)
-
-
 def load_hf_pretrained(variant: str):
+  # FIXME: Does not work with the current split-qkv dense matrices.
   """Load HF-Transformers GPT2 weights."""
   assert variant in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
 

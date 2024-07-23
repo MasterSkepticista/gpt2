@@ -2,6 +2,5 @@ jax[cuda12]==0.4.30
 flax
 clu
 optax
-einops
 tiktoken
 tensorflow-cpu

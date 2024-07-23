@@ -6,10 +6,13 @@ Updates:
 - [x] Add support for `tf.data` pipelines over TFRecords.
 - [x] Add support for `bfloat16` computation.
 - [x] SPMD (multi-node) training support using `pmap`.
-- [ ] Expose configurables via CLI flags.
+- [ ] Expose configurables via CLI flags (or config dict).
 - [ ] Use cuDNN flash attention kernel.
 - [ ] Add `shard_map` support for model and data sharding.
-
+- [ ] `nn.Embed` typecast performance issue.
+- [ ] Refactor `load_hf_pretrained` to support split-dense qkv weights.
+- [ ] Use scale init for residual paths.
+- [ ] Finish incomplete docstrings.
 ## Setup
 Create a virtual environment and install packages.
 ```shell
