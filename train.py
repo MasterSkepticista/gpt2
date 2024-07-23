@@ -1,5 +1,4 @@
 """Trains GPT-2."""
-import functools
 import os
 from typing import Any, Tuple
 
@@ -16,6 +15,8 @@ from flax.training.checkpoints import save_checkpoint
 from model import GPT, get_config, load_hf_pretrained
 
 logging.set_verbosity("info")
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
+flax.config.update("flax_use_orbax_checkpointing", False)
 
 flags.DEFINE_string("workdir", 
                     default=None, 
@@ -94,15 +95,19 @@ def get_train_step(model: Any, grad_accum_steps: int):
     def loss_fn(params, batch):
       x, y = batch
       logits = model.apply({"params": params}, x)
+      # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
+      # if logits are `bfloat16`.
+      # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
+      logits = jnp.asarray(logits, jnp.float32)
       loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
       return loss.mean()
 
-    # Compute local gradient.
+    # Compute gradients.
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = u.accumulate_gradient(grad_fn, state.params, batch, grad_accum_steps)
     grads = jax.lax.pmean(grads, axis_name="batch")
 
-    # Compute and apply updates.
+    # Apply updates.
     updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
 
@@ -130,6 +135,10 @@ def get_eval_step(model: Any):
   def eval_step(state: TrainState, batch: PyTree) -> dict:
     x, y = batch
     logits = model.apply({"params": state.params}, x)
+    # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
+    # if logits are `bfloat16`.
+    # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
+    logits = jnp.asarray(logits, jnp.float32)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     return {"loss": loss.mean()}
   
@@ -139,7 +148,8 @@ def main(unused_argv):
   if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
     jax.distributed.initialize()
   lead_host = jax.process_index() == 0
-  logging.info("Hello from process %d holding %d device(s)", jax.process_index(), jax.local_device_count())
+  logging.info("Hello from process %d holding %d device(s)", 
+                jax.process_index(), jax.local_device_count())
 
   def info(s, *a):
     if lead_host:
