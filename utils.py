@@ -38,6 +38,9 @@ def recover_tree(keys, values, sep: str = "."):
     tree[k] = recover_tree(*zip(*kv_pairs))
   return tree
 
+def unreplicate_and_get(tree: PyTree) -> PyTree:
+  """Fetches to CPU the first local copy of a `pmap` replicated tree."""
+  return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], tree))
 
 def tf_to_numpy(batch: PyTree) -> PyTree:
   """Zero-copy numpy conversion."""

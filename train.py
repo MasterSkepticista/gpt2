@@ -2,6 +2,7 @@
 import os
 from typing import Any, Tuple
 
+import flax
 import jax
 import jax.numpy as jnp
 import optax
@@ -193,7 +194,7 @@ def main(unused_argv):
 
   # Build data pipeline.
   batch_size = 512  # corresponds to 0.5M tokens at block_size=1024
-  grad_accum_steps = 4
+  grad_accum_steps = 1
   local_batch_size = batch_size // jax.process_count()
   info("Global batch size: %d (%d tokens per batch)", batch_size, batch_size * cfg.block_size)
   info("Local batch size: %d", local_batch_size)
@@ -226,23 +227,25 @@ def main(unused_argv):
   
   # Logging setup.
   log_summary_steps = 10
-  log_eval_steps = 50
+  log_eval_steps = 500
   writer = metric_writers.AsyncWriter(metric_writers.SummaryWriter(FLAGS.workdir))
   progress = periodic_actions.ReportProgress(
     num_train_steps=max_steps, writer=writer, every_steps=log_summary_steps)
+  profile = periodic_actions.Profile(
+    logdir=FLAGS.workdir, num_profile_steps=5, every_secs=None)
   hooks = []
   if lead_host:
-    hooks.append(progress)
+    hooks.extend((progress, profile))
 
   # Train loop.
   train_metrics = []
-  info("Starting training at step %d", start_step + 1)
+  info("Starting training loop at step %d", start_step + 1)
   for step in range(start_step + 1, max_steps + 1):
 
     # Train step.
     train_batch = next(train_iter)
     state, metrics = train_step(state, train_batch)
-    train_metrics.append(jax_utils.unreplicate(metrics))
+    train_metrics.append(u.unreplicate_and_get(state))
 
     for h in hooks:
       h(step)
@@ -265,9 +268,8 @@ def main(unused_argv):
         u.log_summary(step, eval_metrics, writer=writer, prefix="val")
 
       with progress.timed("checkpoint"):
-        unrepl_state = jax.device_get(jax_utils.unreplicate(state))
         if lead_host:
-          save_checkpoint(FLAGS.workdir, unrepl_state, step=step)
+          save_checkpoint(FLAGS.workdir, u.unreplicate_and_get(state), step=step)
 
     writer.flush()
 
