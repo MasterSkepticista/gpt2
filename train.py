@@ -12,7 +12,7 @@ import utils as u
 from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
 from flax import jax_utils
-from flax.training.checkpoints import save_checkpoint
+from flax.training.checkpoints import save_checkpoint, restore_checkpoint
 from flax.training.train_state import TrainState
 from ml_collections import config_flags
 from model import GPT, load_hf_pretrained
@@ -98,8 +98,9 @@ def get_train_step(grad_accum_steps: int):
       # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
       # if logits are `bfloat16`.
       # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
-      logits = jnp.asarray(logits, jnp.float32)
-      loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+      # logits = jnp.asarray(logits, jnp.float32)
+      y_oh = jax.nn.one_hot(y, logits.shape[-1])
+      loss = optax.softmax_cross_entropy(logits, y_oh)
       return loss.mean()
 
     # Compute gradients and apply updates.
@@ -127,8 +128,8 @@ def get_eval_step():
     # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
     # if logits are `bfloat16`.
     # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
-    logits = jnp.asarray(logits, jnp.float32)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    y_oh = jax.nn.one_hot(y, logits.shape[-1])
+    loss = optax.softmax_cross_entropy(logits, y_oh)
     return {"loss": loss.mean()}
   
   return eval_step
