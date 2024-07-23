@@ -6,7 +6,7 @@ Updates:
 - [x] Add support for `tf.data` pipelines over TFRecords.
 - [x] Add support for `bfloat16` computation.
 - [x] SPMD (multi-node) training support using `pmap`.
-- [ ] Expose configurables via CLI flags (or config dict).
+- [x] Expose configurables via CLI flags (or config dict).
 - [ ] Use cuDNN flash attention kernel.
 - [ ] Add `shard_map` support for model and data sharding.
 - [ ] `nn.Embed` typecast performance issue.
@@ -32,17 +32,17 @@ $> python fineweb.py --outdir /path/to/store/tfrecord
 ## Train
 ```shell
 # Single process, multi-GPU.
-$> python train.py --workdir artifacts/gpt2_124M
+$> python train.py --workdir artifacts/gpt2_124M --config configs/default.py
 
 # multi-process on same host using OpenMPI.
-$> mpirun -n 8 -bind-to socket python train.py --workdir artifacts/gpt2_124M
+$> mpirun -n 8 -bind-to socket python train.py --workdir artifacts/gpt2_124M --config configs/default.py
 
 # multi-node across 8 hosts (ensure you have common NFS mounts figured out).
 $> mpirun -n 8 \
           -pernode \
           -H hostname1,hostname2,...,hostname8 \
           -bind-to socket \
-          python train.py --workdir artifacts/gpt2_124M
+          python train.py --workdir artifacts/gpt2_124M --config configs/default.py
 ```
 
 ## License
