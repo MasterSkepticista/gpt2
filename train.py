@@ -197,8 +197,11 @@ def main(unused_argv):
       mask=jax.tree.map(lambda p: p.ndim > 1, params)))
 
   # Resume from checkpoint or start from scratch.
-  start_step = 0
   state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+  state = restore_checkpoint(FLAGS.workdir, state)
+  start_step = state.step
+
+  # Replicate.
   state = jax_utils.replicate(state)
   train_step = jax.pmap(get_train_step(cfg.grad_accum_steps), axis_name="batch")
   eval_step = jax.pmap(get_eval_step(), axis_name="batch")
