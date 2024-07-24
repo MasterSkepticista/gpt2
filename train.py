@@ -75,10 +75,10 @@ def build_pipeline(data_dir: str,
 
 
 # @jax.jit
-def sample(model, params, tokens, rng: jnp.ndarray):
+def sample(state, tokens, rng: jnp.ndarray):
   """Samples next token."""
   bs = tokens.shape[0]
-  logits = model.apply({"params": params}, tokens)
+  logits = state.apply_fn({"params": state.params}, tokens)
   logits = logits[:, -1, :]
   topk_logits, topk_indices = jax.lax.top_k(logits, k=50)
   idx = jax.random.categorical(rng, topk_logits, axis=-1, shape=(bs, 1))
@@ -162,29 +162,12 @@ def main(unused_argv):
   params, gflops = init(rng_init)
   info(f"GFLOPs for model: {gflops:.4f}")
 
-  # Sample few tokens.
-  if False:
-    tokenizer = tiktoken.get_encoding("gpt2")
-    prompt = "Hello, I am a language model,"
-    tokens = jnp.array([tokenizer.encode(prompt)])[:, :config.block_size]
-    info(prompt, end="")
-    while True:
-      # Generate next token.
-      rng, rng_sample = jax.random.split(rng)
-      next_token = sample(model, params, tokens, rng_sample)
-      if next_token[0] == tokenizer.eot_token:
-        break
-      tokens = jnp.concat([tokens, next_token], axis=-1)
-      if tokens.shape[-1] > config.block_size:
-        tokens = tokens[:, -config.block_size:]
-      info(tokenizer.decode(next_token[0]), end="")
-
   # Build data pipeline.
   local_batch_size = cfg.batch_size // jax.process_count()
   info("Batch size: %d", cfg.batch_size)
   info("Tokens per batch: %d", cfg.batch_size * cfg.model.block_size)
-  train_iter = build_pipeline("data", local_batch_size, cfg.model.block_size, train=True)
-  val_iter = build_pipeline("data", local_batch_size, cfg.model.block_size, train=False)
+  train_iter = build_pipeline(cfg.data_dir, local_batch_size, cfg.model.block_size, train=True)
+  val_iter = build_pipeline(cfg.data_dir, local_batch_size, cfg.model.block_size, train=False)
 
   # Build optimizer and train state.
   sched_fn = u.get_cosine_lr_schedule(

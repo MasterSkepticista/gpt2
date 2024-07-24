@@ -21,6 +21,9 @@ def _set_model(config: dict, variant):
 def get_config():
   config = ml_collections.ConfigDict()
 
+  # Dataset.
+  config.data_dir = "./data"
+
   # Model
   _set_model(config, "gpt2")
   config.model.dtype = "bfloat16"  # Precision of computation.
