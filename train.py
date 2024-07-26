@@ -38,21 +38,23 @@ FLAGS = flags.FLAGS
 def build_pipeline(data_dir: str,
                    batch_size: int,
                    block_size: int,
+                   shuffle_seed: int,
                    train: bool = False):
   """Builds tf.data pipeline."""
 
   split = "train" if train else "val"
-  ds = tf.data.Dataset.list_files(os.path.join(data_dir, f"{split}_*.tfrecord"))
+  ds = tf.data.Dataset.list_files(
+    os.path.join(data_dir, f"{split}_*.tfrecord"), shuffle=False)
 
   if train:
-    ds = ds.shuffle(256)  # At shards-level.
+    ds = ds.shuffle(256, seed=shuffle_seed)  # At shards-level.
 
   ds = tf.data.TFRecordDataset(ds)
   ds = ds.shard(jax.process_count(), jax.process_index())
   ds = ds.repeat()
   
   if train:
-    ds = ds.shuffle(10_000)  # At documents-level.
+    ds = ds.shuffle(10_000, seed=shuffle_seed)  # At documents-level.
 
   def _decode(proto):
     ex = tf.io.parse_single_example(proto, {"tokens": tf.io.FixedLenFeature([], tf.string)})
@@ -146,11 +148,11 @@ def main(unused_argv):
       logging.info("\u001b[32mNOTE\u001b[0m: " + s, *a)
 
   info("Total devices: %d", jax.device_count())
-  rng = jax.random.PRNGKey(42)
 
   # Initialize model.
   cfg = FLAGS.config
   model = GPT(**cfg.model)
+  rng = jax.random.PRNGKey(cfg.rng_seed)
   rng, rng_init = jax.random.split(rng)
 
   def init(rng):
@@ -166,8 +168,10 @@ def main(unused_argv):
   local_batch_size = cfg.batch_size // jax.process_count()
   info("Batch size: %d", cfg.batch_size)
   info("Tokens per batch: %d", cfg.batch_size * cfg.model.block_size)
-  train_iter = build_pipeline(cfg.data_dir, local_batch_size, cfg.model.block_size, train=True)
-  val_iter = build_pipeline(cfg.data_dir, local_batch_size, cfg.model.block_size, train=False)
+  train_iter = build_pipeline(
+    cfg.data_dir, local_batch_size, cfg.model.block_size, cfg.rng_seed, train=True)
+  val_iter = build_pipeline(
+    cfg.data_dir, local_batch_size, cfg.model.block_size, cfg.rng_seed, train=False)
 
   # Build optimizer and train state.
   sched_fn = u.get_cosine_lr_schedule(
