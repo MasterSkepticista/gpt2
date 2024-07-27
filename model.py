@@ -65,6 +65,7 @@ class SelfAttention(nn.Module):
 
 class MlpBlock(nn.Module):
   """MLP block."""
+  proj_kernel_init: Callable[..., Any] = nn.initializers.Initializer
   kernel_init: Callable[..., Any] = nn.initializers.normal(0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
@@ -82,7 +83,7 @@ class MlpBlock(nn.Module):
     x = nn.gelu(x)
     x = dense(
         out_dim,
-        kernel_init=self.kernel_init,
+        kernel_init=self.proj_kernel_init,
         bias_init=self.bias_init,
         dtype=self.dtype,
         name="c_proj")(x)  # yapf: disable
@@ -94,6 +95,7 @@ class Block(nn.Module):
   emb_dim: int
   num_heads: int
   sdpa_implementation: Literal["xla", "cudnn"]
+  residual_kernel_init: nn.initializers.Initializer
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
@@ -110,6 +112,7 @@ class Block(nn.Module):
 
     mlp = MlpBlock(
         kernel_init=self.kernel_init,
+        proj_kernel_init=self.residual_kernel_init,
         bias_init=self.bias_init,
         dtype=self.dtype,
         name="mlp")
@@ -122,27 +125,35 @@ class Block(nn.Module):
     return x
 
 
-class Transformer(nn.Module):
-  emb_dim: int
-  num_heads: int
-  num_layers: int
-  sdpa_implementation: Literal["xla", "cudnn"]
-  kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
-  bias_init: Callable[..., Any] = nn.initializers.zeros
+class Embed(nn.Module):
+  """Same as nn.Embed, but without an explicit typecast in __call__.
+	
+	Can be eliminated if this issue is fixed:
+	https://github.com/google/flax/issues/4100
+	"""
+  num_embeddings: int
+  features: int
   dtype: jnp.dtype = jnp.float32
+  param_dtype: jnp.dtype = jnp.float32
+  embedding_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
 
-  @nn.compact
-  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-    for i in range(self.num_layers):
-      x = Block(
-          self.emb_dim,
-          self.num_heads,
-          sdpa_implementation=self.sdpa_implementation,
-          kernel_init=self.kernel_init,
-          bias_init=self.bias_init,
-          dtype=self.dtype,
-          name=str(i))(x)  # yapf: disable
-    return x
+  def setup(self):
+    self.embedding = self.param(
+        "embedding",
+        self.embedding_init,
+        (self.num_embeddings, self.features),
+        self.param_dtype,
+    )
+
+  def __call__(self, idx: jnp.ndarray) -> jnp.ndarray:
+    """Pluck embeddings of given `idx`."""
+    return jnp.take(self.embedding, idx, axis=0)
+
+  def attend(self, query: jnp.ndarray) -> jnp.ndarray:
+    """Project `query` to entire `num_embeddings` space."""
+    query, embedding = (query.astype(self.dtype),
+                        self.embedding.astype(self.dtype))
+    return query @ embedding.T
 
 
 class GPT(nn.Module):
@@ -165,13 +176,13 @@ class GPT(nn.Module):
         f"Input sequence length {T} is greater than block size {self.block_size}"
     )
 
-    wte = nn.Embed(
+    wte = Embed(
         self.vocab_size,
         features=self.emb_dim,
         embedding_init=self.embedding_init,
         dtype=self.dtype,
         name="wte")
-    wpe = nn.Embed(
+    wpe = Embed(
         self.block_size,
         features=self.emb_dim,
         embedding_init=self.embedding_init,
@@ -184,15 +195,17 @@ class GPT(nn.Module):
     x = tok_emb + pos_emb
 
     # Apply transformer blocks.
-    x = Transformer(
-        self.emb_dim,
-        self.num_heads,
-        self.num_layers,
-        sdpa_implementation=self.sdpa_implementation,
-        kernel_init=self.kernel_init,
-        bias_init=self.bias_init,
-        dtype=self.dtype,
-        name="h")(x)  # yapf: disable
+    residual_kernel_init = nn.initializers.normal(0.02 / jnp.sqrt(2 * self.num_layers))
+    for i in range(self.num_layers):
+      x = Block(
+          self.emb_dim,
+          self.num_heads,
+          sdpa_implementation=self.sdpa_implementation,
+          kernel_init=self.kernel_init,
+          residual_kernel_init=residual_kernel_init,
+          bias_init=self.bias_init,
+          dtype=self.dtype,
+          name=str(i))(x)  # yapf: disable
 
     # Final layer norm and classification.
     x = nn.LayerNorm(dtype=self.dtype, name="ln_f")(x)

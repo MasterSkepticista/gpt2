@@ -7,12 +7,11 @@ import jax
 import jax.numpy as jnp
 import optax
 import tensorflow as tf
-import tiktoken
 import utils as u
 from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
 from flax import jax_utils
-from flax.training.checkpoints import save_checkpoint, restore_checkpoint
+from flax.training.checkpoints import restore_checkpoint, save_checkpoint
 from flax.training.train_state import TrainState
 from ml_collections import config_flags
 from model import GPT, load_hf_pretrained
