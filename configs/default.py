@@ -20,6 +20,7 @@ def _set_model(config: dict, variant):
 
 def get_config():
   config = ml_collections.ConfigDict()
+  config.rng_seed = 42
 
   # Dataset.
   config.data_dir = "./data"
@@ -27,7 +28,7 @@ def get_config():
   # Model
   _set_model(config, "gpt2")
   config.model.dtype = "bfloat16"  # Precision of computation.
-  # See note in README. This has caveats.
+  # Only supported in JAX SDPA API.
   config.model.sdpa_implementation = "cudnn"  # "xla" or "cudnn".
 
   # Optimizer
@@ -42,7 +43,6 @@ def get_config():
   # Training
   config.batch_size = 512  # Corresponds to 512 * config.model.block_size tokens per batch.
   config.grad_accum_steps = 1  # Increment in orders of 2 if facing OOM.
-  config.total_steps = 19073
   config.log_train_steps = 50
   config.log_eval_steps = 1000  # Also checkpoints the model.
 
