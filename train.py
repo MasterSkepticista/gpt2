@@ -10,6 +10,7 @@ import tensorflow as tf
 import utils as u
 from absl import app, flags, logging
 from clu import metric_writers, periodic_actions
+from clu.parameter_overview import get_parameter_overview
 from flax import jax_utils
 from flax.training.checkpoints import restore_checkpoint, save_checkpoint
 from flax.training.train_state import TrainState
@@ -161,6 +162,7 @@ def main(unused_argv):
     return params, gflops
 
   params, gflops = init(rng_init)
+  info(get_parameter_overview(params))
   info(f"GFLOPs for model: {gflops:.4f}")
 
   # Build data pipeline.

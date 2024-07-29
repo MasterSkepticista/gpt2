@@ -31,14 +31,17 @@ class SelfAttention(nn.Module):
     b, t, c = x.shape
     head_dim = c // self.num_heads
 
-    dense = functools.partial(
-        nn.DenseGeneral,
-        features=(self.num_heads, head_dim),
-        kernel_init=self.kernel_init,
-        bias_init=self.bias_init,
-        dtype=self.dtype)
-
-    q, k, v = (dense(name=name)(x) for name in ("q", "k", "v"))
+    dense = nn.Dense(
+      features=(3 * c),
+      kernel_init=self.kernel_init,
+      bias_init=self.bias_init,
+      dtype=self.dtype,
+      name="c_attn")
+    
+    # Project to q/k/v and multi-heads.
+    q, k, v = jnp.split(dense(x), 3, axis=-1)
+    q, k, v = jax.tree.map(
+      lambda t: t.reshape(b, -1, self.num_heads, head_dim), (q, k, v))
 
     if FLAGS.flash_attention:
       # Flash attention.
