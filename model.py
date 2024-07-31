@@ -217,7 +217,6 @@ class GPT(nn.Module):
 
 
 def load_hf_pretrained(variant: str):
-  # FIXME: Does not work with the current split-qkv dense matrices.
   """Load HF-Transformers GPT2 weights."""
   assert variant in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
 
@@ -228,15 +227,12 @@ def load_hf_pretrained(variant: str):
 
   # Rename torch params to flax params.
   hf_params = {k.replace("transformer.", ""): v for k, v in hf_params.items()}
+  hf_params = {k.replace("h.", ""): v for k, v in hf_params.items()}
+  hf_params = {k.replace("wte.weight", "wte.embedding"): v for k, v in hf_params.items()}
+  hf_params = {k.replace("wpe.weight", "wpe.embedding"): v for k, v in hf_params.items()}
   hf_params = {
-      k.replace("wte.weight", "wte.embedding"): v for k, v in hf_params.items()
-  }
-  hf_params = {
-      k.replace("wpe.weight", "wpe.embedding"): v for k, v in hf_params.items()
-  }
-  hf_params = {
-      (k.replace(".weight", ".scale") if "ln" in k else k): v
-      for k, v in hf_params.items()
+    (k.replace(".weight", ".scale") if "ln" in k else k): v
+    for k, v in hf_params.items()
   }
   hf_params = {k.replace(".weight", ".kernel"): v for k, v in hf_params.items()}
   hf_params.pop("lm_head.kernel")  # Same as wte.embedding
