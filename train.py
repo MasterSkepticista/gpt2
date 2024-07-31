@@ -210,8 +210,8 @@ def main(unused_argv):
 
   # Train loop.
   train_metrics = []
-  info("Starting training loop at step %d", start_step)
-  for step in range(start_step, cfg.total_steps):
+  info("Starting training loop at step %d", start_step + 1)
+  for step in range(start_step + 1, cfg.total_steps + 1):
 
     # Train step.
     train_batch = next(train_iter)
@@ -222,13 +222,13 @@ def main(unused_argv):
       h(step)
 
     # Log train stats.
-    if (step + 1) % cfg.log_train_steps == 0:
+    if step % cfg.log_train_steps == 0:
       extra_logs = {"global_schedule": sched_fn(step)}
-      u.log_summary(step+1, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
+      u.log_summary(step, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
       train_metrics = []
     
     # Evaluate and store checkpoints.
-    if (step + 1) % cfg.log_eval_steps == 0 or (step + 1) == cfg.total_steps:
+    if step % cfg.log_eval_steps == 0 or step == cfg.total_steps:
       info("Running eval")
       with progress.timed("eval"):
         eval_metrics = []
