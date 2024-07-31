@@ -108,7 +108,7 @@ def get_train_step(grad_accum_steps: int):
     # Compute gradients and apply updates.
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = u.accumulate_gradient(grad_fn, state.params, batch, grad_accum_steps)
-    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss, grads = jax.lax.pmean((loss, grads), axis_name="batch")
     new_state = state.apply_gradients(grads=grads)
 
     # Metrics.
@@ -210,8 +210,8 @@ def main(unused_argv):
 
   # Train loop.
   train_metrics = []
-  info("Starting training loop at step %d", start_step + 1)
-  for step in range(start_step + 1, cfg.total_steps + 1):
+  info("Starting training loop at step %d", start_step)
+  for step in range(start_step, cfg.total_steps):
 
     # Train step.
     train_batch = next(train_iter)
@@ -222,13 +222,13 @@ def main(unused_argv):
       h(step)
 
     # Log train stats.
-    if step % cfg.log_train_steps == 0:
+    if (step + 1) % cfg.log_train_steps == 0:
       extra_logs = {"global_schedule": sched_fn(step)}
-      u.log_summary(step, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
+      u.log_summary(step+1, train_metrics, extra_logs=extra_logs, writer=writer, prefix="train")
       train_metrics = []
     
     # Evaluate and store checkpoints.
-    if step % cfg.log_eval_steps == 0 or step == cfg.total_steps:
+    if (step + 1) % cfg.log_eval_steps == 0 or (step + 1) == cfg.total_steps:
       info("Running eval")
       with progress.timed("eval"):
         eval_metrics = []
@@ -236,7 +236,7 @@ def main(unused_argv):
           eval_batch = next(val_iter)
           metrics = eval_step(state, eval_batch)
           eval_metrics.append(jax.device_get(jax_utils.unreplicate(metrics)))
-        u.log_summary(step, eval_metrics, writer=writer, prefix="val")
+        u.log_summary(step+1, eval_metrics, writer=writer, prefix="val")
 
       with progress.timed("checkpoint"):
         if lead_host:
