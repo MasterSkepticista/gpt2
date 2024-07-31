@@ -28,7 +28,6 @@ def get_config():
   # Model
   _set_model(config, "gpt2")
   config.model.dtype = "bfloat16"  # Precision of computation.
-  # Only supported in JAX SDPA API.
   config.model.sdpa_implementation = "cudnn"  # "xla" or "cudnn".
 
   # Optimizer
@@ -37,13 +36,12 @@ def get_config():
   config.warmup_steps = 715
   config.total_steps = 19073
   config.grad_clip_norm = 1.0
-  config.optax_name = "adamw"
   config.optax_kwargs = dict(b1=0.9, b2=0.95, weight_decay=0.1)
 
   # Training
   config.batch_size = 512  # Corresponds to 512 * config.model.block_size tokens per batch.
   config.grad_accum_steps = 1  # Increment in orders of 2 if facing OOM.
   config.log_train_steps = 50
-  config.log_eval_steps = 1000  # Also checkpoints the model.
+  config.log_eval_steps = 500  # Also checkpoints the model.
 
   return config

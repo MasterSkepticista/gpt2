@@ -180,7 +180,7 @@ def main(unused_argv):
 
   tx = optax.chain(
     optax.clip_by_global_norm(cfg.grad_clip_norm),
-    getattr(optax, cfg.optax_name)(
+    optax.adamw(
       sched_fn, 
       **cfg.optax_kwargs, 
       mask=jax.tree.map(lambda p: p.ndim > 1, params)))
@@ -236,7 +236,7 @@ def main(unused_argv):
           eval_batch = next(val_iter)
           metrics = eval_step(state, eval_batch)
           eval_metrics.append(jax.device_get(jax_utils.unreplicate(metrics)))
-        u.log_summary(step+1, eval_metrics, writer=writer, prefix="val")
+        u.log_summary(step, eval_metrics, writer=writer, prefix="val")
 
       with progress.timed("checkpoint"):
         if lead_host:
