@@ -120,8 +120,8 @@ class Block(nn.Module):
         dtype=self.dtype,
         name="mlp")
 
-    ln_1 = nn.LayerNorm(dtype=self.dtype, name="ln_1")
-    ln_2 = nn.LayerNorm(dtype=self.dtype, name="ln_2")
+    ln_1 = nn.LayerNorm(name="ln_1")
+    ln_2 = nn.LayerNorm(name="ln_2")
 
     x = x + attn(ln_1(x))
     x = x + mlp(ln_2(x))
@@ -211,7 +211,7 @@ class GPT(nn.Module):
           name=str(i))(x)  # yapf: disable
 
     # Final layer norm and classification.
-    x = nn.LayerNorm(dtype=self.dtype, name="ln_f")(x)
+    x = nn.LayerNorm(name="ln_f")(x)
     x = wte.attend(x)
     return x
 
