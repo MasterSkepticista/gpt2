@@ -100,7 +100,6 @@ def get_train_step(grad_accum_steps: int):
       # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
       # if logits are `bfloat16`.
       # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
-      # logits = jnp.asarray(logits, jnp.float32)
       y_oh = jax.nn.one_hot(y, logits.shape[-1])
       loss = optax.softmax_cross_entropy(logits, y_oh)
       return loss.mean()
@@ -131,8 +130,9 @@ def get_eval_step():
     # if logits are `bfloat16`.
     # Relevant issue: https://github.com/google-deepmind/optax/issues/1020
     y_oh = jax.nn.one_hot(y, logits.shape[-1])
-    loss = optax.softmax_cross_entropy(logits, y_oh)
-    return {"loss": loss.mean()}
+    loss = optax.softmax_cross_entropy(logits, y_oh).mean()
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    return {"loss": loss}
   
   return eval_step
 

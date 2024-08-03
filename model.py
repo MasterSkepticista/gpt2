@@ -4,18 +4,24 @@ from typing import Any, Callable, Literal
 
 import jax
 import jax.numpy as jnp
-from absl import flags
 from flax import linen as nn
 from utils import recover_tree
 
-flags.DEFINE_bool(
-    "flash_attention", default=True, help="Whether to use JAX SDPA kernel.")
-FLAGS = flags.FLAGS
-
 
 class SelfAttention(nn.Module):
-  """Multi-Headed Causal Self-Attention."""
+  """Multi-Headed Causal Self-Attention.
+  
+  Attributes:
+    num_heads: Number of attention heads.
+    proj_kernel_init: Initializer for residual stream projection.
+    implementation: Attention implementation. `cudnn` will use flash attention only 
+      on supported GPUs. Defaults to `xla`.
+    kernel_init: Initializer for qkv projection.
+    bias_init: Initializer for qkv biases.
+    dtype: DType of the computation (default: float32).
+  """
   num_heads: int
+  proj_kernel_init: Callable[..., Any]
   implementation: Literal["xla", "cudnn"] = "xla"
   kernel_init: Callable[..., Any] = nn.initializers.normal(0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
@@ -28,11 +34,11 @@ class SelfAttention(nn.Module):
         f"Embedding dimension {x.shape[-1]} must be divisible by num_heads {self.num_heads}"
     )
 
-    b, t, c = x.shape
-    head_dim = c // self.num_heads
+    bs, seqlen, features = x.shape
+    head_dim = features // self.num_heads
 
     dense = nn.Dense(
-      features=(3 * c),
+      features=(3 * features),
       kernel_init=self.kernel_init,
       bias_init=self.bias_init,
       dtype=self.dtype,
@@ -41,28 +47,18 @@ class SelfAttention(nn.Module):
     # Project to q/k/v and multi-heads.
     q, k, v = jnp.split(dense(x), 3, axis=-1)
     q, k, v = jax.tree.map(
-      lambda t: t.reshape(b, -1, self.num_heads, head_dim), (q, k, v))
+      lambda t: t.reshape(bs, -1, self.num_heads, head_dim), (q, k, v))
 
-    if FLAGS.flash_attention:
-      # Flash attention.
-      x = jax.nn.dot_product_attention(
-          q, k, v, is_causal=True, implementation=self.implementation)
-    else:
-      # Standard attention (for educational purposes).
-      mask = nn.make_causal_mask(jnp.zeros((b, t)))
-      scale = 1.0 / jnp.sqrt(c)
-      attn = jnp.einsum("...qhd,...khd->...hqk", q, k * scale)
-      attn = jnp.where(mask, attn, jnp.finfo(jnp.float32).min)
-      attn = jax.nn.softmax(attn, axis=-1)
-      x = jnp.einsum("...hqk,...khd->...qhd", attn, v)
+    x = jax.nn.dot_product_attention(
+        q, k, v, is_causal=True, implementation=self.implementation)
 
-    x = jnp.reshape(x, (b, t, c))
-    out = nn.Dense(
-        features=c,
-        kernel_init=self.kernel_init,
+    out = nn.DenseGeneral(
+        features=features,
+        axis=(-2, -1),
+        kernel_init=self.proj_kernel_init,
         bias_init=self.bias_init,
-        name="c_proj",
-        dtype=self.dtype)(x)  # yapf: disable
+        dtype=self.dtype,
+        name="c_proj")(x)  # yapf: disable
     return out
 
 
@@ -75,21 +71,15 @@ class MlpBlock(nn.Module):
 
   @nn.compact
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    out_dim = x.shape[-1]
     dense = functools.partial(
         nn.Dense,
-        kernel_init=self.kernel_init,
         bias_init=self.bias_init,
         dtype=self.dtype)
-    out_dim = x.shape[-1]
 
-    x = dense(4 * out_dim, name="c_fc")(x)
+    x = dense(4 * out_dim, kernel_init=self.kernel_init, name="c_fc")(x)
     x = nn.gelu(x)
-    x = dense(
-        out_dim,
-        kernel_init=self.proj_kernel_init,
-        bias_init=self.bias_init,
-        dtype=self.dtype,
-        name="c_proj")(x)  # yapf: disable
+    x = dense(out_dim, kernel_init=self.proj_kernel_init, name="c_proj")(x)
     return x
 
 
@@ -109,6 +99,7 @@ class Block(nn.Module):
         self.num_heads,
         implementation=self.sdpa_implementation,
         kernel_init=self.kernel_init,
+        proj_kernel_init=self.residual_kernel_init,
         bias_init=self.bias_init,
         dtype=self.dtype,
         name="attn")
