@@ -53,9 +53,6 @@ def build_pipeline(data_dir: str,
   ds = ds.shard(jax.process_count(), jax.process_index())
   ds = ds.repeat()
   
-  if train:
-    ds = ds.shuffle(10_000, seed=shuffle_seed)  # At documents-level.
-
   def _decode(proto):
     ex = tf.io.parse_single_example(proto, {"tokens": tf.io.FixedLenFeature([], tf.string)})
     return tf.io.decode_raw(ex["tokens"], tf.uint16)
@@ -63,6 +60,10 @@ def build_pipeline(data_dir: str,
   ds = ds.map(_decode, num_parallel_calls=tf.data.AUTOTUNE)
   ds = ds.unbatch()  # Flattens to a stream of tokens.
   ds = ds.batch(block_size + 1, drop_remainder=True)
+  
+  if train:
+    ds = ds.shuffle(10_000, seed=shuffle_seed)  # At batch-level.
+
   ds = ds.map(lambda x: (x[:-1], x[1:]))  # Input and Next (completion) pairs.
   ds = ds.batch(batch_size, drop_remainder=True)
 
