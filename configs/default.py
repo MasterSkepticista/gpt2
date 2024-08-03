@@ -15,7 +15,7 @@ def _set_model(config: dict, variant):
   }
   config.model = variants[variant]
   config.model.name = variant
-  config.model.vocab_size = 50_257
+  config.model.vocab_size = 50_304
   config.model.block_size = 1024
 
 def get_config():
