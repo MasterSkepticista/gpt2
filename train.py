@@ -15,7 +15,7 @@ from flax import jax_utils
 from flax.training.checkpoints import restore_checkpoint, save_checkpoint
 from flax.training.train_state import TrainState
 from ml_collections import config_flags
-from model import GPT, load_hf_pretrained
+from model import GPT
 
 logging.set_verbosity("info")
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
@@ -46,11 +46,12 @@ def build_pipeline(data_dir: str,
   ds = tf.data.Dataset.list_files(
     os.path.join(data_dir, f"{split}_*.tfrecord"), shuffle=False)
 
-  if train:
-    ds = ds.shuffle(256, seed=shuffle_seed)  # At shards-level.
-
   ds = tf.data.TFRecordDataset(ds)
   ds = ds.shard(jax.process_count(), jax.process_index())
+  
+  if train:
+    ds = ds.shuffle(100_000, seed=shuffle_seed)  # At documents-level.
+  
   ds = ds.repeat()
   
   def _decode(proto):
@@ -59,14 +60,12 @@ def build_pipeline(data_dir: str,
 
   ds = ds.map(_decode, num_parallel_calls=tf.data.AUTOTUNE)
   ds = ds.unbatch()  # Flattens to a stream of tokens.
-  ds = ds.batch(block_size + 1, drop_remainder=True)
+  ds = ds.batch(block_size + 1)
   
   if train:
     ds = ds.shuffle(10_000, seed=shuffle_seed)  # At batch-level.
 
-  ds = ds.map(lambda x: (x[:-1], x[1:]))  # Input and Next (completion) pairs.
-  ds = ds.batch(batch_size, drop_remainder=True)
-
+  ds = ds.batch(batch_size)
   ds = ds.prefetch(tf.data.AUTOTUNE)
 
   # Shard batches to GPUs.
@@ -96,7 +95,7 @@ def get_train_step(grad_accum_steps: int):
     measurements = {}
 
     def loss_fn(params, batch):
-      x, y = batch
+      x, y = batch[:, :-1], batch[:, 1:]
       logits = state.apply_fn({"params": params}, x)
       # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
       # if logits are `bfloat16`.
@@ -125,7 +124,7 @@ def get_eval_step():
   """Returns a fn that runs one step of eval."""
 
   def eval_step(state: TrainState, batch: Any) -> dict:
-    x, y = batch
+    x, y = batch[:, :-1], batch[:, 1:]
     logits = state.apply_fn({"params": state.params}, x)
     # FIXME: Quantization bug in `optax.softmax_ce_with_integer_labels` 
     # if logits are `bfloat16`.
@@ -236,7 +235,7 @@ def main(unused_argv):
         for _ in range(20):
           eval_batch = next(val_iter)
           metrics = eval_step(state, eval_batch)
-          eval_metrics.append(jax.device_get(jax_utils.unreplicate(metrics)))
+          eval_metrics.append(u.unreplicate_and_get(metrics))
         u.log_summary(step, eval_metrics, writer=writer, prefix="val")
 
       with progress.timed("checkpoint"):
