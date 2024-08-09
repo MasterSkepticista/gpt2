@@ -121,8 +121,9 @@ class Block(nn.Module):
 
 class Embed(nn.Module):
   """Same as nn.Embed, but without an explicit typecast in __call__.
+  This slightly improves throughput (2-5%).
 	
-	Can be eliminated if this issue is fixed:
+	Can be removed once this issue is fixed:
 	https://github.com/google/flax/issues/4100
 	"""
   num_embeddings: int

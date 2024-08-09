@@ -10,10 +10,10 @@ Updates:
 - [x] Use cuDNN flash attention kernel (SDPA API) (https://github.com/google/jax/issues/22546).
 - [x] `nn.Embed` typecast performance issue.
 - [x] Use scale init for residual paths.
-- [x] Fix large gradient norm spikes for longer training runs (likely due to bad init).
+- [x] Fix large gradient norm spikes for longer training runs.
 - [x] Test `accumulate_gradient`.
+- [x] Update docstrings.
 - [ ] Add `shard_map` support for model and data sharding.
-- [ ] Finish incomplete docstrings.
 - [ ] KV cache decoding.
 ### Setup
 Create a virtual environment and install packages.
@@ -48,6 +48,7 @@ mpirun -n 8 \
           -bind-to socket \
           python train.py --workdir artifacts/gpt2_124M --config configs/default.py
 ```
+<img src="https://github.com/MasterSkepticista/gpt2/raw/main/.github/loss.jpg">
 
 ### License
 MIT
