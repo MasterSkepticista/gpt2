@@ -10,11 +10,42 @@ from clu import metric_writers
 PyTree = Any
 
 
-def compute_flops(apply_fn: Callable,
-                  dummy_inputs: list,
+def compute_flops(n_ctx: int,
+                  n_vocab: int,
+                  n_layers: int,
+                  n_heads: int,
+                  d_model: int,
+                  ff_ratio: float = 4,
                   fuse_multiply_add: bool = True) -> float:
-  """Compute the number of FLOPs of a Flax model."""
-  analysis = jax.jit(apply_fn).lower(*dummy_inputs).compile().cost_analysis()[0]
+  """Computes forward pass FLOPs per sequence based on Deepmind's Chinchilla paper.
+  
+  Ref: https://arxiv.org/pdf/2203.15556
+  """
+  fma_factor = 1 if fuse_multiply_add else 2
+  flops = 0
+
+  flops += fma_factor * (3 * n_ctx * d_model**2)  # QKV projection.
+  flops += fma_factor * (n_ctx**2 * d_model)  # Q @ K.T
+  flops += 3 * n_ctx**2 * n_heads  # Softmax
+  flops += fma_factor * (n_ctx**2 * d_model)  # Attention reduction.
+  flops += fma_factor * (n_ctx * d_model**2)  # Out projection
+  flops += fma_factor * (n_ctx * d_model) * (2 * ff_ratio * d_model)  # MLPBlock.
+  flops *= n_layers
+
+  flops += fma_factor * (n_ctx * d_model)  # Embeddings forward.
+  flops += fma_factor * (n_ctx * n_vocab * d_model)  # Project to n_vocab logits.
+  return flops
+
+def compute_flops_v2(apply_fn: Callable,
+                            dummy_inputs: list,
+                            fuse_multiply_add: bool = True) -> float:
+  """Compute the number of FLOPs of a Flax model.
+  
+  Do not use.
+  This interferes with backends (e.g. if cuDNN SDPA API is enabled) and gives inconsistent counts.
+  Possibly replace `compute_flops` with this method if JAX inconsistency of FLOP analysis is resolved.
+  """
+  analysis = jax.jit(apply_fn, backend="cpu").lower(*dummy_inputs).cost_analysis()
   # Not all JAX backends return analysis.
   # See: https://jax.readthedocs.io/en/latest/aot.html#debug-information-and-analyses-when-available
   # Ideally we should be able to get flops analysis with `CPU` backend to save GPU memory.
@@ -38,9 +69,11 @@ def recover_tree(keys, values, sep: str = "."):
     tree[k] = recover_tree(*zip(*kv_pairs))
   return tree
 
+
 def unreplicate_and_get(tree: PyTree) -> PyTree:
   """Fetches to CPU the first local copy of a `pmap` replicated tree."""
   return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], tree))
+
 
 def tf_to_numpy(batch: PyTree) -> PyTree:
   """Zero-copy numpy conversion."""

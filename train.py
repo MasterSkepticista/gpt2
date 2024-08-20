@@ -61,10 +61,6 @@ def build_pipeline(data_dir: str,
   ds = ds.map(_decode, num_parallel_calls=tf.data.AUTOTUNE)
   ds = ds.unbatch()  # Flattens to a stream of tokens.
   ds = ds.batch(block_size + 1)
-  
-  if train:
-    ds = ds.shuffle(10_000, seed=shuffle_seed)  # At batch-level.
-
   ds = ds.batch(batch_size)
   ds = ds.prefetch(tf.data.AUTOTUNE)
 
@@ -158,7 +154,12 @@ def main(unused_argv):
   def init(rng):
     dummy_input = jnp.ones((1, cfg.model.block_size), dtype=jnp.int32)
     params = jax.jit(model.init)(rng, dummy_input)["params"]
-    gflops = u.compute_flops(model.apply, [{"params": params}, dummy_input]) / 1e9
+    gflops = u.compute_flops(
+      cfg.model.block_size, 
+      cfg.model.vocab_size, 
+      cfg.model.num_layers,
+      cfg.model.num_heads,
+      cfg.model.emb_dim) / 1e9
     return params, gflops
 
   params, gflops = init(rng_init)
