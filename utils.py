@@ -16,7 +16,7 @@ def compute_flops(n_ctx: int,
                   n_heads: int,
                   d_model: int,
                   ff_ratio: float = 4,
-                  fuse_multiply_add: bool = True) -> float:
+                  fuse_multiply_add: bool = False) -> float:
   """Computes forward pass FLOPs per sequence based on Deepmind's Chinchilla paper.
   
   Ref: https://arxiv.org/pdf/2203.15556
