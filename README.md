@@ -28,7 +28,8 @@ sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
 
 ### Prepare `TFRecords`
 ```shell
-python fineweb.py --outdir /path/to/store/tfrecord
+# Also set the same `data_dir` under `configs/default.py`
+python fineweb.py --outdir ./data
 ```
 
 ### Train
