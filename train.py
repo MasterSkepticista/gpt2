@@ -133,6 +133,9 @@ def get_eval_step():
   return eval_step
 
 def main(unused_argv):
+  # Prevent TF from taking up all GPU memory.
+  tf.config.experimental.set_visible_devices([], 'GPU')
+  
   if os.environ.get("OMPI_COMM_WORLD_SIZE", -1) != -1:
     jax.distributed.initialize()
   lead_host = jax.process_index() == 0

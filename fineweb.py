@@ -37,7 +37,7 @@ def main():
     # Also related - https://github.com/huggingface/datasets/issues/4352
     return {"tokens": np.asarray(tokens, dtype=np.uint16).tobytes()}
 
-  ds = ds.map(_tokenize, num_proc=os.cpu_count() // 2, desc="Tokenizing documents")
+  ds = ds.map(_tokenize)
 
   # Shard dataset
   num_shards = 100
