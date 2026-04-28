@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from attention import naive_attention, cudnn_flash_attention, flash_attention_fwd
+from attention import naive_attention, cudnn_attention, flash_attention
 
 def online_softmax(x: jax.Array):
   out = jnp.zeros_like(x).astype(jnp.float32)
@@ -36,12 +36,31 @@ def main(argv):
   q = jax.random.normal(keys[0], (B, T, H, C), jnp.bfloat16)
   k = jax.random.normal(keys[1], (B, T, H, C), jnp.bfloat16)
   v = jax.random.normal(keys[2], (B, T, H, C), jnp.bfloat16)
+  do = jax.random.normal(keys[3], (B, T, H, C), jnp.bfloat16)
 
+  # Forward pass
   o_naive = naive_attention(q, k, v)
-  o_cudnn = cudnn_flash_attention(q, k, v)
-  o_flash, _ = flash_attention_fwd(q, k, v)
+  o_cudnn = cudnn_attention(q, k, v)
+  o_flash = flash_attention(q, k, v)
+  print("Forward pass result match:", jnp.allclose(o_cudnn, o_flash, atol=1e-2, rtol=1e-2))
 
-  print(jnp.allclose(o_naive, o_flash, atol=1e-2, rtol=1e-2))
+  # Backward pass
+  def loss_ref(q, k, v):
+    return jnp.sum(cudnn_attention(q, k, v) * do)
+  dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
+  print("Reference shapes:", dq_ref.shape, dk_ref.shape, dv_ref.shape)
+
+  def loss(q, k, v):
+    return jnp.sum(flash_attention(q, k, v) * do)
+  dq_flash, dk_flash, dv_flash = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+  print("Flash shapes:", dq_flash.shape, dk_flash.shape, dv_flash.shape)
+
+  print("Backward pass dQ match:", jnp.allclose(dq_ref, dq_flash, atol=1e-2, rtol=1e-2))
+  print("Backward pass dK match:", jnp.allclose(dk_ref, dk_flash, atol=1e-2, rtol=1e-2))
+  print("Backward pass dV match:", jnp.allclose(dv_ref, dv_flash, atol=1e-2, rtol=1e-2))
+
+
+
 
 
 
