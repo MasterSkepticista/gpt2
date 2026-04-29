@@ -265,6 +265,8 @@ def flash_attention_bwd_dkv_kernel(
   dk_acc = jnp.zeros(dk_ref.shape, dtype=jnp.float32)
   dv_acc = jnp.zeros(dv_ref.shape, dtype=jnp.float32)
 
+  k_block = pl.program_id(axis=1)
+  k_pos = k_block * Bc + jnp.arange(Bc)
   def body(i, carry):
     dk_acc, dv_acc = carry
     idx = pl.dslice(i * Br, Br)
@@ -274,8 +276,11 @@ def flash_attention_bwd_dkv_kernel(
     lse = plgpu.load(lse_ref.at[0, idx])
     d = plgpu.load(d_ref.at[0, idx])
 
-    # TODO: Add causal masking
     s = pl.dot(q, k, trans_b=True) / scale
+    if causal:
+      q_pos = i * Br + jnp.arange(Br)
+      mask = q_pos[:, None] >= k_pos[None, :]
+      s = jnp.where(mask, s, -jnp.inf)
     p = jnp.exp(s - lse[:, None])
 
     dp = pl.dot(do, v, trans_b=True)
@@ -348,14 +353,22 @@ def flash_attention_bwd_dq_kernel(
 
   dq_acc = jnp.zeros(q_ref.shape, dtype=jnp.float32)
 
+  q_block = pl.program_id(axis=1)
+  q_pos = q_block * Br + jnp.arange(Br)
+
   def body(i, carry):
     dq_acc = carry
     idx = pl.dslice(i * Bc, Bc)
     k = plgpu.load(k_ref.at[0, idx, :])
     v = plgpu.load(v_ref.at[0, idx, :])
     
-    # TODO: causal mask
     s = pl.dot(q, k, trans_b=True) / scale
+
+    if causal:
+      k_pos = i * Bc + jnp.arange(Bc)
+      mask = q_pos[:, None] >= k_pos[None, :]
+      s = jnp.where(mask, s, -jnp.inf)
+
     p = jnp.exp(s - lse[:, None])
 
     dp = pl.dot(do, v, trans_b=True)
@@ -451,9 +464,9 @@ def flash_attention_bwd(
 
 # Register vjp
 # ============
-@jax.custom_vjp
+@partial(jax.custom_vjp, nondiff_argnums=(3,))
 def flash_attention(
-  query: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
+  query: jax.Array, key: jax.Array, value: jax.Array, causal: bool = False) -> jax.Array:
   """Flash attention using Pallas.
   
   Args:
@@ -465,16 +478,16 @@ def flash_attention(
   Returns:
     jax.Array of shape (batch..., q_length, num_heads, depth).
   """
-  o, _ = flash_attention_fwd(query, key, value)
+  o, _ = flash_attention_fwd(query, key, value, causal=causal)
   return o
 
-def flash_attention_fwd_rule(query, key, value):
-  o, lse = flash_attention_fwd(query, key, value)
+def flash_attention_fwd_rule(query, key, value, causal):
+  o, lse = flash_attention_fwd(query, key, value, causal=causal)
   return o, (query, key, value, o, lse)
 
-def flash_attention_bwd_rule(res, g):
+def flash_attention_bwd_rule(causal, res, g):
   query, key, value, o, lse = res
-  dq, dk, dv = flash_attention_bwd(query, key, value, o, lse, g)
+  dq, dk, dv = flash_attention_bwd(query, key, value, o, lse, g, causal=causal)
   return dq, dk, dv
 
 flash_attention.defvjp(flash_attention_fwd_rule, flash_attention_bwd_rule)

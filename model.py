@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from utils import recover_tree
+from attention import flash_attention
 
 
 class SelfAttention(nn.Module):
@@ -49,8 +50,7 @@ class SelfAttention(nn.Module):
     q, k, v = jax.tree.map(
       lambda t: t.reshape(bs, -1, self.num_heads, head_dim), (q, k, v))
 
-    x = jax.nn.dot_product_attention(
-        q, k, v, is_causal=True, implementation=self.implementation)
+    x = flash_attention(q, k, v, causal=True)
 
     out = nn.DenseGeneral(
         features=features,

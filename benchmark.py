@@ -39,19 +39,19 @@ def main(argv):
   do = jax.random.normal(keys[3], (B, T, H, C), jnp.bfloat16)
 
   # Forward pass
-  o_naive = naive_attention(q, k, v)
-  o_cudnn = cudnn_attention(q, k, v)
-  o_flash = flash_attention(q, k, v)
-  print("Forward pass result match:", jnp.allclose(o_cudnn, o_flash, atol=1e-2, rtol=1e-2))
+  # o_ref = naive_attention(q, k, v, causal=True)
+  o_ref = cudnn_attention(q, k, v, causal=True)
+  o_flash = flash_attention(q, k, v, causal=True)
+  print("Forward pass result match:", jnp.allclose(o_ref, o_flash, atol=1e-2, rtol=1e-2))
 
   # Backward pass
   def loss_ref(q, k, v):
-    return jnp.sum(cudnn_attention(q, k, v) * do)
+    return jnp.sum(cudnn_attention(q, k, v, causal=True) * do)
   dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
   print("Reference shapes:", dq_ref.shape, dk_ref.shape, dv_ref.shape)
 
   def loss(q, k, v):
-    return jnp.sum(flash_attention(q, k, v) * do)
+    return jnp.sum(flash_attention(q, k, v, causal=True) * do)
   dq_flash, dk_flash, dv_flash = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
   print("Flash shapes:", dq_flash.shape, dk_flash.shape, dv_flash.shape)
 
