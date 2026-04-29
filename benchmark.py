@@ -39,14 +39,13 @@ def main(argv):
   do = jax.random.normal(keys[3], (B, T, H, C), jnp.bfloat16)
 
   # Forward pass
-  # o_ref = naive_attention(q, k, v, causal=True)
-  o_ref = cudnn_attention(q, k, v, causal=True)
+  o_ref = naive_attention(q, k, v, causal=True)
   o_flash = flash_attention(q, k, v, causal=True)
   print("Forward pass result match:", jnp.allclose(o_ref, o_flash, atol=1e-2, rtol=1e-2))
 
   # Backward pass
   def loss_ref(q, k, v):
-    return jnp.sum(cudnn_attention(q, k, v, causal=True) * do)
+    return jnp.sum(naive_attention(q, k, v, causal=True) * do)
   dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
   print("Reference shapes:", dq_ref.shape, dk_ref.shape, dv_ref.shape)
 

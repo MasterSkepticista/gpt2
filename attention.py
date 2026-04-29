@@ -79,7 +79,7 @@ def cudnn_attention(
     jax.Array of shape (..., H, C).
   """
   return jax.nn.dot_product_attention(
-    query, key, value, is_causal=causal, implementation="xla")
+    query, key, value, is_causal=causal, implementation="cudnn")
 
 # Pallas Kernels.
 # =================
