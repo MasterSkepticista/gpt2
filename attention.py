@@ -10,6 +10,36 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 @jax.jit
+def dot_product_attention(
+  query: jax.Array,
+  key: jax.Array,
+  value: jax.Array,
+  mask: jax.Array,
+) -> jax.Array:
+  """Dot-product attention with optional masking.
+  
+  Args:
+    query: jax.Array of shape (batch..., q_length, num_heads, depth)
+    key: jax.Array of shape (batch..., kv_length, num_heads, depth)
+    value: jax.Array of shape (batch..., kv_length, num_heads, depth)
+    mask: jax.Array of shape (q_length, kv_length) with boolean values. True for valid positions.
+  
+  Returns:
+    jax.Array of shape (batch..., q_length, num_heads, depth).
+  """
+  depth = query.shape[-1]
+  attn_weights = jnp.einsum(
+    "...qhd,...khd->...hqk", query, key) / jnp.sqrt(depth)
+  
+  if mask is not None:
+    attn_weights = jnp.where(mask[None, None, :, :], attn_weights, -jnp.inf)
+  
+  attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+  out = jnp.einsum(
+    "...hqk,...khd->...qhd", attn_weights, value)
+  return out
+
+
 def naive_attention(
   query: jax.Array, key: jax.Array, value: jax.Array, causal: bool = False) -> jax.Array:
   """Naive dot-product-attention kernel that materializes everything into global memory.
@@ -24,17 +54,16 @@ def naive_attention(
   Returns:
     jax.Array of shape (batch..., q_length, num_heads, depth).
   """
-  depth = query.shape[-1]
-  attn_weights = jnp.einsum(
-    "...qhd,...khd->...hqk", query, key) / jnp.sqrt(depth)
-  
+  mask = None
   if causal:
-    mask = jnp.tril(jnp.ones(attn_weights.shape[-2:], dtype=bool))
-    attn_weights = jnp.where(mask, attn_weights, -jnp.inf)
-  attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-  out = jnp.einsum(
-    "...hqk,...khd->...qhd", attn_weights, value)
-  return out
+    q_len = query.shape[-3]
+    kv_len = key.shape[-3]
+    assert q_len == kv_len, "For causal attention, query and key lengths must be the same"
+    q_pos = jnp.arange(q_len)[:, None]
+    k_pos = jnp.arange(q_len)[None, :]
+    mask = q_pos >= k_pos
+
+  return dot_product_attention(query, key, value, mask)
 
 def cudnn_attention(
   query: jax.Array, key: jax.Array, value: jax.Array, causal: bool = False) -> jax.Array:
@@ -124,7 +153,7 @@ def flash_attention_fwd_kernel(
   plgpu.store(o_ref.at[0, :, :], o.astype(o_ref.dtype))
   plgpu.store(lse_ref.at[0, :], lse.astype(lse_ref.dtype))
 
-@jax.jit
+
 def flash_attention_fwd(
   query: jax.Array, 
   key: jax.Array, 
