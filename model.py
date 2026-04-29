@@ -92,7 +92,7 @@ class Block(nn.Module):
   """Transformer block."""
   emb_dim: int
   num_heads: int
-  sdpa_implementation: Literal["xla", "cudnn", "pallas"] = "xla"
+  sdpa_implementation: Literal["xla", "cudnn", "pallas"]
   residual_kernel_init: nn.initializers.Initializer
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
@@ -163,7 +163,7 @@ class GPT(nn.Module):
   emb_dim: int
   num_heads: int
   num_layers: int
-  sdpa_implementation: Literal["xla", "cudnn", "pallas"] = "xla"
+  sdpa_implementation: Literal["xla", "cudnn", "pallas"]
   embedding_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
