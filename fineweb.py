@@ -21,7 +21,7 @@ def main():
   args = parser.parse_args()
 
   # Download the dataset.
-  ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
+  ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True).take(10000)
 
   # Tokenizer.
   enc = tiktoken.get_encoding("gpt2")
@@ -37,10 +37,10 @@ def main():
     # Also related - https://github.com/huggingface/datasets/issues/4352
     return {"tokens": np.asarray(tokens, dtype=np.uint16).tobytes()}
 
-  ds = ds.map(_tokenize, num_proc=os.cpu_count() // 2)
+  ds = ds.map(_tokenize)
 
   # Shard dataset
-  num_shards = 100
+  num_shards = 10
   shards = [ds.shard(num_shards, i) for i in range(num_shards)]
 
   # Write TFRecords.
