@@ -105,34 +105,26 @@ def flash_attention_fwd_kernel(
   """Forward pass kernel for flash attention.
   
   Args:
-    q_ref: Slice of query tensor of shape [1, Br, C].
-    k_ref: Slice of key tensor of shape [1, kv_length, C].
-    v_ref: Slice of value tensor of shape [1, kv_length, C].
-    o_ref: Output buffer of size [1, Br, C].
-    lse_ref: Log-sum-exp buffer of size [1, Br].
+    q_ref: Slice of query tensor of shape [1, Br, 1, C].
+    k_ref: Slice of key tensor of shape [1, kv_length, 1, C].
+    v_ref: Slice of value tensor of shape [1, kv_length, 1, C].
+    o_ref: Output buffer of size [1, Br, 1, C].
+    lse_ref: Log-sum-exp buffer of size [1, 1, Br].
     scale: Scaling factor for attention scores (usually sqrt of head dimension).
 
   """
-  q = plgpu.load(q_ref.at[0, :, :])
+  q = plgpu.load(q_ref.at[0, :, 0, :])
   o = jnp.zeros_like(q, dtype=jnp.float32)
   m_i = jnp.full((Br,), -jnp.inf, dtype=jnp.float32)
   l_i = jnp.zeros((Br,), dtype=jnp.float32)
 
-  q_block = pl.program_id(axis=1)
-  q_pos = q_block * Br + jnp.arange(Br)
-
   def body(i, carry):
     o_prev, m_prev, l_prev = carry
     idx = pl.dslice(i * Bc, Bc)
-    k = plgpu.load(k_ref.at[0, idx, :])
-    v = plgpu.load(v_ref.at[0, idx, :])
+    k = plgpu.load(k_ref.at[0, idx, 0, :])
+    v = plgpu.load(v_ref.at[0, idx, 0, :])
 
     qk = pl.dot(q, k, trans_b=True) / scale
-
-    if causal:
-      k_pos = i * Bc + jnp.arange(Bc)
-      mask = q_pos[:, None] >= k_pos[None, :]
-      qk = jnp.where(mask, qk, -jnp.inf)
 
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
@@ -150,8 +142,8 @@ def flash_attention_fwd_kernel(
   o /= l_i[:, None]
   lse = m_i + jnp.log(l_i)
 
-  plgpu.store(o_ref.at[0, :, :], o.astype(o_ref.dtype))
-  plgpu.store(lse_ref.at[0, :], lse.astype(lse_ref.dtype))
+  plgpu.store(o_ref.at[0, :, 0, :], o.astype(o_ref.dtype))
+  plgpu.store(lse_ref.at[0, 0, :], lse.astype(lse_ref.dtype))
 
 
 def flash_attention_fwd(
@@ -172,42 +164,35 @@ def flash_attention_fwd(
     Tuple (output, logsumexp).
   """
   bs, q_len, num_heads, head_dim = query.shape
-
-  # Computing attention is independent across heads, so we merge the batch and head dimensions. This was the optimization in FAv2.
-  bs_flat = bs * num_heads
-  q_flat, k_flat, v_flat = jax.tree.map(
-    lambda x: x.transpose(0, 2, 1, 3).reshape(bs_flat, q_len, head_dim), (query, key, value))
   scale = math.sqrt(head_dim)
 
   # Grid size eqvt to how many kernel invocations happen.
-  grid = (bs_flat, pl.cdiv(q_len, Br))
+  grid = (bs, num_heads, pl.cdiv(q_len, Br))
   num_k_blocks = pl.cdiv(q_len, Bc)
 
-  out_flat, lse = pl.pallas_call(
+  out, lse = pl.pallas_call(
     partial(flash_attention_fwd_kernel, scale=scale, num_k_blocks=num_k_blocks, causal=causal),
     out_shape=[
-      jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
-      jax.ShapeDtypeStruct((bs_flat, q_len), q_flat.dtype)
+      jax.ShapeDtypeStruct(query.shape, query.dtype),
+      jax.ShapeDtypeStruct((bs, num_heads, q_len), query.dtype)
     ],
     grid=grid,
     in_specs=[
-      pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, q_len, head_dim), lambda b, _: (b, 0, 0)),
-      pl.BlockSpec((1, q_len, head_dim), lambda b, _: (b, 0, 0))
+      pl.BlockSpec((1, Br, 1, head_dim), lambda b, h, t: (b, t, h, 0)),
+      pl.BlockSpec((1, q_len, 1, head_dim), lambda b, h, _: (b, 0, h, 0)),
+      pl.BlockSpec((1, q_len, 1, head_dim), lambda b, h, _: (b, 0, h, 0))
     ],
     out_specs=[
-      pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, Br), lambda b, t: (b, t))
+      pl.BlockSpec((1, Br, 1, head_dim), lambda b, h, t: (b, t, h, 0)),
+      pl.BlockSpec((1, 1, Br), lambda b, h, t: (b, h, t))
     ],
     interpret=True,
     compiler_params=plgpu.CompilerParams(
       num_warps=4,
       num_stages=2
     )
-  )(q_flat, k_flat, v_flat)
+  )(query, key, value)
 
-  out = out_flat.reshape(bs, num_heads, q_len, head_dim).transpose(0, 2, 1, 3)
-  lse = lse.reshape(bs, num_heads, q_len)
   return out, lse
 
 # Backward Pass
