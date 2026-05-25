@@ -113,7 +113,7 @@ def flash_attention_fwd_kernel(
     scale: Scaling factor for attention scores (usually sqrt of head dimension).
 
   """
-  q = plgpu.load(q_ref.at[0, :, 0, :])
+  q = plgpu.load(q_ref)
   o = jnp.zeros_like(q, dtype=jnp.float32)
   m_i = jnp.full((Br,), -jnp.inf, dtype=jnp.float32)
   l_i = jnp.zeros((Br,), dtype=jnp.float32)
@@ -121,8 +121,8 @@ def flash_attention_fwd_kernel(
   def body(i, carry):
     o_prev, m_prev, l_prev = carry
     idx = pl.dslice(i * Bc, Bc)
-    k = plgpu.load(k_ref.at[0, idx, 0, :])
-    v = plgpu.load(v_ref.at[0, idx, 0, :])
+    k = plgpu.load(k_ref.at[idx, :])
+    v = plgpu.load(v_ref.at[idx, :])
 
     qk = pl.dot(q, k, trans_b=True) / scale
 
@@ -142,8 +142,8 @@ def flash_attention_fwd_kernel(
   o /= l_i[:, None]
   lse = m_i + jnp.log(l_i)
 
-  plgpu.store(o_ref.at[0, :, 0, :], o.astype(o_ref.dtype))
-  plgpu.store(lse_ref.at[0, 0, :], lse.astype(lse_ref.dtype))
+  plgpu.store(o_ref, o.astype(o_ref.dtype))
+  plgpu.store(lse_ref, lse.astype(lse_ref.dtype))
 
 
 def flash_attention_fwd(
@@ -178,13 +178,13 @@ def flash_attention_fwd(
     ],
     grid=grid,
     in_specs=[
-      pl.BlockSpec((1, Br, 1, head_dim), lambda b, h, t: (b, t, h, 0)),
-      pl.BlockSpec((1, q_len, 1, head_dim), lambda b, h, _: (b, 0, h, 0)),
-      pl.BlockSpec((1, q_len, 1, head_dim), lambda b, h, _: (b, 0, h, 0))
+      pl.BlockSpec((None, Br, None, head_dim), lambda b, h, t: (b, t, h, 0)),
+      pl.BlockSpec((None, q_len, None, head_dim), lambda b, h, _: (b, 0, h, 0)),
+      pl.BlockSpec((None, q_len, None, head_dim), lambda b, h, _: (b, 0, h, 0))
     ],
     out_specs=[
-      pl.BlockSpec((1, Br, 1, head_dim), lambda b, h, t: (b, t, h, 0)),
-      pl.BlockSpec((1, 1, Br), lambda b, h, t: (b, h, t))
+      pl.BlockSpec((None, Br, None, head_dim), lambda b, h, t: (b, t, h, 0)),
+      pl.BlockSpec((None, None, Br), lambda b, h, t: (b, h, t))
     ],
     interpret=True,
     compiler_params=plgpu.CompilerParams(
