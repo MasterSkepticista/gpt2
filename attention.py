@@ -166,8 +166,8 @@ def flash_attention_fwd(
   bs, q_len, num_heads, head_dim = query.shape
   scale = math.sqrt(head_dim)
 
-  # Grid size eqvt to how many kernel invocations happen.
-  grid = (bs, num_heads, pl.cdiv(q_len, Br))
+  # Match mha.py program axis order: (q_tile, batch, head).
+  grid = (pl.cdiv(q_len, Br), bs, num_heads)
   num_k_blocks = pl.cdiv(q_len, Bc)
 
   out, lse = pl.pallas_call(
@@ -178,13 +178,13 @@ def flash_attention_fwd(
     ],
     grid=grid,
     in_specs=[
-      pl.BlockSpec((None, Br, None, head_dim), lambda b, h, t: (b, t, h, 0)),
-      pl.BlockSpec((None, q_len, None, head_dim), lambda b, h, _: (b, 0, h, 0)),
-      pl.BlockSpec((None, q_len, None, head_dim), lambda b, h, _: (b, 0, h, 0))
+      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, q_len, None, head_dim), lambda _, b, h: (b, 0, h, 0)),
+      pl.BlockSpec((None, q_len, None, head_dim), lambda _, b, h: (b, 0, h, 0))
     ],
     out_specs=[
-      pl.BlockSpec((None, Br, None, head_dim), lambda b, h, t: (b, t, h, 0)),
-      pl.BlockSpec((None, None, Br), lambda b, h, t: (b, h, t))
+      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, None, Br), lambda t, b, h: (b, h, t))
     ],
     interpret=True,
     compiler_params=plgpu.CompilerParams(
