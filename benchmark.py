@@ -5,6 +5,7 @@ from absl import flags
 from functools import partial
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 
 from attention import flash_attention, naive_attention, cudnn_attention
@@ -51,15 +52,19 @@ def main(argv):
       raise ValueError(f"Invalid implementation: {FLAGS.impl}")
 
   q, k, v = generate_tensors(1, 1024, 12, 64)
+  def ref_loss(q, k, v):
+    out = naive_attention(q, k, v, causal=False)
+    return jnp.sum(out)
+  o_ref = naive_attention(q, k, v, causal=False)
+  dq_ref, dk_ref, dv_ref = jax.grad(ref_loss, argnums=(0, 1, 2))(q, k, v)
+
   def loss(q, k, v):
     out = attention_fn(q, k, v, causal=False)
     return jnp.sum(out)
-  o_ref = naive_attention(q, k, v, causal=False)
-  dq_ref, dk_ref, dv_ref = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
   jit_fwd_fn = jax.jit(partial(attention_fn, causal=False))
   jit_fwd_bwd_fn = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
-  jnp.allclose(jit_fwd_fn(q, k, v), o_ref, rtol=1e-2, atol=1e-2)
-  jax.tree.map(lambda x, y: jnp.allclose(x, y, rtol=1e-2, atol=1e-2), 
+  np.testing.assert_allclose(jit_fwd_fn(q, k, v), o_ref, rtol=1e-2, atol=1e-2)
+  jax.tree.map(lambda x, y: np.testing.assert_allclose(x, y, rtol=1e-2, atol=1e-2), 
     jit_fwd_bwd_fn(q, k, v), (dq_ref, dk_ref, dv_ref))
   print("Results match. Starting benchmark...")
   print("Benchmarking attention implementation:", FLAGS.impl)
