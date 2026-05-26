@@ -68,17 +68,15 @@ def main(argv):
     bs = MAX_TOKENS // T
     num_heads = 2048 // FLAGS.head_dim
     q, k, v = generate_tensors(bs, T, num_heads, FLAGS.head_dim)
+    flop_count = 4 * T**2 * FLAGS.head_dim * num_heads * bs
 
     # Forward pass
-    jit_fwd_fn = jax.jit(partial(attention_fn, causal=False))
-    flop_count = 4 * T**2 * FLAGS.head_dim * num_heads * bs
     avg_time = timeit(jit_fwd_fn, q, k, v)
     tflops = flop_count * 1e-12 / avg_time
     mfu = (tflops / 121) * 100  # Using 121 TFLOPs for L4 as per notebook context
     print(f"(fwd) T={T:5d}, B={bs:3d}, TFLOP/s={tflops:.2f}, MFU={mfu:.2f}%")
 
     # Forward + Backward pass
-    jit_fwd_bwd_fn = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
     avg_time = timeit(jit_fwd_bwd_fn, q, k, v)
     tflops = flop_count * 3.5 * 1e-12 / avg_time  # Backward is ~2.5x forward
     mfu = (tflops / 121) * 100  # Using 121 TFLOPs for L4 as per notebook context
