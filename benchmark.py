@@ -51,9 +51,16 @@ def main(argv):
       raise ValueError(f"Invalid implementation: {FLAGS.impl}")
 
   q, k, v = generate_tensors(1, 1024, 12, 64)
-  o_ref = naive_attention(q, k, v, causal=False)    
+  def loss(q, k, v):
+    out = attention_fn(q, k, v, causal=False)
+    return jnp.sum(out)
+  o_ref = naive_attention(q, k, v, causal=False)
+  dq_ref, dk_ref, dv_ref = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
   jit_fwd_fn = jax.jit(partial(attention_fn, causal=False))
+  jit_fwd_bwd_fn = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
   jnp.allclose(jit_fwd_fn(q, k, v), o_ref, rtol=1e-2, atol=1e-2)
+  jax.tree.map(lambda x, y: jnp.allclose(x, y, rtol=1e-2, atol=1e-2), 
+    jit_fwd_bwd_fn(q, k, v), (dq_ref, dk_ref, dv_ref))
   print("Results match. Starting benchmark...")
   print("Benchmarking attention implementation:", FLAGS.impl)
 
@@ -71,9 +78,6 @@ def main(argv):
     print(f"(fwd) T={T:5d}, B={bs:3d}, TFLOP/s={tflops:.2f}, MFU={mfu:.2f}%")
 
     # Forward + Backward pass
-    def loss(q, k, v):
-      out = attention_fn(q, k, v, causal=False)
-      return jnp.sum(out)
     jit_fwd_bwd_fn = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
     avg_time = timeit(jit_fwd_bwd_fn, q, k, v)
     tflops = flop_count * 3.5 * 1e-12 / avg_time  # Backward is ~2.5x forward
