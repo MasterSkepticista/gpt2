@@ -105,11 +105,11 @@ def flash_attention_fwd_kernel(
   """Forward pass kernel for flash attention.
   
   Args:
-    q_ref: Slice of query tensor of shape [1, Br, 1, C].
-    k_ref: Slice of key tensor of shape [1, kv_length, 1, C].
-    v_ref: Slice of value tensor of shape [1, kv_length, 1, C].
-    o_ref: Output buffer of size [1, Br, 1, C].
-    lse_ref: Log-sum-exp buffer of size [1, 1, Br].
+    q_ref: Slice of query tensor of shape [Br, C].
+    k_ref: Slice of key tensor of shape [kv_length, C].
+    v_ref: Slice of value tensor of shape [kv_length, C].
+    o_ref: Output buffer of size [Br, C].
+    lse_ref: Log-sum-exp buffer of size [Br].
     scale: Scaling factor for attention scores (usually sqrt of head dimension).
 
   """
