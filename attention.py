@@ -263,7 +263,7 @@ def flash_attention_bwd_dkv_kernel(
     s = pl.dot(q, k.T) * qk_scale
     p = jnp.exp2(s - lse[:, None])
 
-    dp = pl.dot(do, v, trans_b=True)
+    dp = pl.dot(do, v.T)
     ds = p * (dp - d[:, None]) / scale
 
     dv_acc += pl.dot(p.astype(do.dtype), do, trans_a=True)
@@ -341,7 +341,7 @@ def flash_attention_bwd_dq_kernel(
     s = pl.dot(q, k.T) * qk_scale
     p = jnp.exp2(s - lse[:, None])
 
-    dp = pl.dot(do, v, trans_b=True)
+    dp = pl.dot(do, v.T)
     ds = p * (dp - d[:, None]) / scale
 
     dq_acc += pl.dot(ds.astype(k.dtype), k)
