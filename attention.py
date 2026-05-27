@@ -125,7 +125,7 @@ def flash_attention_fwd_kernel(
     v = plgpu.load(v_ref.at[idx, :])
 
     qk_scale = math.log2(math.e) / scale
-    qk = pl.dot(q, k, trans_b=True) * qk_scale
+    qk = pl.dot(q, k.T) * qk_scale
 
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
@@ -205,32 +205,31 @@ def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref):
   d = jnp.sum((o * do).astype(jnp.float32), axis=-1)
   plgpu.store(d_ref, d.astype(d_ref.dtype))
 
-def flash_attention_bwd_preprocess(o_flat, do_flat):
+def flash_attention_bwd_preprocess(o, do):
   """Computes `D = row_sum(O * dO)`.
 
   Args:
-    o_flat: jax.Array of shape (bs * num_heads, seqlen, head_dim)
-    do_flat: jax.Array of shape (bs * num_heads, seqlen, head_dim)
+    o: jax.Array of shape (bs, seqlen, num_heads, head_dim)
+    do: jax.Array of shape (bs, seqlen, num_heads, head_dim)
   
   Returns:
-    D of shape (bs * num_heads, seqlen)
+    D of shape (bs, seqlen, num_heads)
   """
-  bs_flat, seqlen, head_dim = o_flat.shape
-  grid = (bs_flat, pl.cdiv(seqlen, Br))
+  bs, seqlen, num_heads, head_dim = o.shape
+  grid = (pl.cdiv(seqlen, Br), bs, num_heads)
 
-  d_flat = pl.pallas_call(
+  return pl.pallas_call(
     flash_attention_bwd_preprocess_kernel,
-    out_shape=jax.ShapeDtypeStruct((bs_flat, seqlen), o_flat.dtype),
+    out_shape=jax.ShapeDtypeStruct((bs, seqlen, num_heads), o.dtype),
     grid=grid,
     in_specs=[
-      pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
+      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     ],
-    out_specs=pl.BlockSpec((1, Br), lambda b, t: (b, t)),
+    out_specs=pl.BlockSpec((None, Br, None), lambda t, b, h: (b, t, h)),
     interpret=True,
     compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2)
-  )(o_flat, do_flat)
-  return d_flat
+  )(o, do)
 
 
 def flash_attention_bwd_dkv_kernel(
@@ -245,29 +244,23 @@ def flash_attention_bwd_dkv_kernel(
   num_q_blocks: int,
   scale: float, 
   causal: bool):
-  k = plgpu.load(k_ref.at[0, :, :])
-  v = plgpu.load(v_ref.at[0, :, :])
+  k = plgpu.load(k_ref)
+  v = plgpu.load(v_ref)
 
   dk_acc = jnp.zeros(dk_ref.shape, dtype=jnp.float32)
   dv_acc = jnp.zeros(dv_ref.shape, dtype=jnp.float32)
 
-  k_block = pl.program_id(axis=1)
-  k_pos = k_block * Bc + jnp.arange(Bc)
   def body(i, carry):
     dk_acc, dv_acc = carry
     idx = pl.dslice(i * Br, Br)
 
-    q = plgpu.load(q_ref.at[0, idx, :])
-    do = plgpu.load(do_ref.at[0, idx, :])
-    lse = plgpu.load(lse_ref.at[0, idx])
-    d = plgpu.load(d_ref.at[0, idx])
+    q = plgpu.load(q_ref.at[idx, :])
+    do = plgpu.load(do_ref.at[idx, :])
+    lse = plgpu.load(lse_ref.at[idx])
+    d = plgpu.load(d_ref.at[idx])
 
     qk_scale = math.log2(math.e) / scale
-    s = pl.dot(q, k, trans_b=True) * qk_scale
-    if causal:
-      q_pos = i * Br + jnp.arange(Br)
-      mask = q_pos[:, None] >= k_pos[None, :]
-      s = jnp.where(mask, s, -jnp.inf)
+    s = pl.dot(q, k.T) * qk_scale
     p = jnp.exp2(s - lse[:, None])
 
     dp = pl.dot(do, v, trans_b=True)
@@ -283,43 +276,41 @@ def flash_attention_bwd_dkv_kernel(
   plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
 
 def flash_attention_bwd_dkv(
-  q_flat: jax.Array,
-  k_flat: jax.Array,
-  v_flat: jax.Array,
-  d_flat: jax.Array,
-  do_flat: jax.Array,
-  lse_flat: jax.Array,
+  query: jax.Array,
+  key: jax.Array,
+  value: jax.Array,
+  d: jax.Array,
+  do: jax.Array,
+  lse: jax.Array,
   scale: float,
   causal: bool = False,
 ) -> Tuple[jax.Array, jax.Array]:
-  bs_flat, seqlen, head_dim = q_flat.shape
+  bs, seqlen, num_heads, head_dim = query.shape
   num_q_blocks = pl.cdiv(seqlen, Br)
-  grid = (bs_flat, pl.cdiv(seqlen, Bc))
+  grid = (pl.cdiv(seqlen, Bc), bs, num_heads)
 
-  dk_flat, dv_flat = pl.pallas_call(
+  return pl.pallas_call(
     partial(flash_attention_bwd_dkv_kernel, scale=scale, causal=causal, num_q_blocks=num_q_blocks),
     out_shape=[
-      jax.ShapeDtypeStruct(k_flat.shape, k_flat.dtype),
-      jax.ShapeDtypeStruct(v_flat.shape, v_flat.dtype),
+      jax.ShapeDtypeStruct(key.shape, key.dtype),
+      jax.ShapeDtypeStruct(value.shape, value.dtype),
     ],
     grid=grid,
     in_specs=[
-      pl.BlockSpec((1, seqlen, head_dim), lambda b, t: (b, 0, 0)),
-      pl.BlockSpec((1, Bc, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, Bc, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, seqlen), lambda b, t: (b, 0)),
-      pl.BlockSpec((1, seqlen, head_dim), lambda b, t: (b, 0, 0)),
-      pl.BlockSpec((1, seqlen), lambda b, t: (b, 0)),
+      pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
+      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, seqlen, None), lambda t, b, h: (b, 0, h)),
+      pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
+      pl.BlockSpec((None, None, seqlen), lambda t, b, h: (b, h, 0)),
     ],
     out_specs=[
-      pl.BlockSpec((1, Bc, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, Bc, head_dim), lambda b, t: (b, t, 0)),
+      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     ],
     interpret=True,
     compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2)
-  )(q_flat, k_flat, v_flat, d_flat, do_flat, lse_flat)
-
-  return dk_flat, dv_flat
+  )(query, key, value, d, do, lse)
 
 def flash_attention_bwd_dq_kernel(
   q_ref,
@@ -333,30 +324,21 @@ def flash_attention_bwd_dq_kernel(
   causal: bool,
   num_kv_blocks: int,
 ):
-  q = plgpu.load(q_ref.at[0, :, :])
-  d = plgpu.load(d_ref.at[0, :])
-  do = plgpu.load(do_ref.at[0, :, :])
-  lse = plgpu.load(lse_ref.at[0, :])
+  q = plgpu.load(q_ref)
+  d = plgpu.load(d_ref)
+  do = plgpu.load(do_ref)
+  lse = plgpu.load(lse_ref)
 
   dq_acc = jnp.zeros(q_ref.shape, dtype=jnp.float32)
-
-  q_block = pl.program_id(axis=1)
-  q_pos = q_block * Br + jnp.arange(Br)
 
   def body(i, carry):
     dq_acc = carry
     idx = pl.dslice(i * Bc, Bc)
-    k = plgpu.load(k_ref.at[0, idx, :])
-    v = plgpu.load(v_ref.at[0, idx, :])
+    k = plgpu.load(k_ref.at[idx, :])
+    v = plgpu.load(v_ref.at[idx, :])
     
     qk_scale = math.log2(math.e) / scale
-    s = pl.dot(q, k, trans_b=True) * qk_scale
-
-    if causal:
-      k_pos = i * Bc + jnp.arange(Bc)
-      mask = q_pos[:, None] >= k_pos[None, :]
-      s = jnp.where(mask, s, -jnp.inf)
-
+    s = pl.dot(q, k.T) * qk_scale
     p = jnp.exp2(s - lse[:, None])
 
     dp = pl.dot(do, v, trans_b=True)
@@ -369,37 +351,35 @@ def flash_attention_bwd_dq_kernel(
   plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
 def flash_attention_bwd_dq(
-  q_flat: jax.Array,
-  k_flat: jax.Array,
-  v_flat: jax.Array,
-  d_flat: jax.Array,
-  do_flat: jax.Array,
-  lse_flat: jax.Array,
+  query: jax.Array,
+  key: jax.Array,
+  value: jax.Array,
+  d: jax.Array,
+  do: jax.Array,
+  lse: jax.Array,
   scale: float,
   causal: bool = False,
 ) -> jax.Array:
-  bs_flat, seqlen, head_dim = q_flat.shape
+  bs, seqlen, num_heads, head_dim = query.shape
   num_kv_blocks = pl.cdiv(seqlen, Bc)
-  grid = (bs_flat, pl.cdiv(seqlen, Br))
+  grid = (pl.cdiv(seqlen, Br), bs, num_heads)
 
-  dq_flat = pl.pallas_call(
+  return pl.pallas_call(
     partial(flash_attention_bwd_dq_kernel, scale=scale, causal=causal, num_kv_blocks=num_kv_blocks),
-    out_shape=jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
+    out_shape=jax.ShapeDtypeStruct(query.shape, query.dtype),
     grid=grid,
     in_specs=[
-      pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, seqlen, head_dim), lambda b, t: (b, 0, 0)),
-      pl.BlockSpec((1, seqlen, head_dim), lambda b, t: (b, 0, 0)),
-      pl.BlockSpec((1, Br), lambda b, t: (b, t)),
-      pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
-      pl.BlockSpec((1, Br), lambda b, t: (b, t)),
+      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
+      pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
+      pl.BlockSpec((None, Br, None), lambda t, b, h: (b, t, h)),
+      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, None, Br), lambda t, b, h: (b, h, t)),
     ],
-    out_specs=pl.BlockSpec((1, Br, head_dim), lambda b, t: (b, t, 0)),
+    out_specs=pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     interpret=True,
     compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
-  )(q_flat, k_flat, v_flat, d_flat, do_flat, lse_flat)
-
-  return dq_flat
+  )(query, key, value, d, do, lse)
 
 def flash_attention_bwd(
   query: jax.Array,
@@ -424,30 +404,20 @@ def flash_attention_bwd(
   Returns:
 
   """
-  bs, seqlen, num_heads, head_dim = query.shape
-  bs_flat = bs * num_heads
+  head_dim = query.shape[-1]
   scale = math.sqrt(head_dim)
 
-  q_flat, k_flat, v_flat, o_flat, do_flat = jax.tree.map(
-    lambda t: t.transpose(0, 2, 1, 3).reshape(bs_flat, seqlen, head_dim),
-    (query, key, value, o, do)
-  )
-  lse_flat = lse.reshape(bs_flat, seqlen)
-
   # 1. Preprocess: D = row_sum(O * dO)
-  d_flat = flash_attention_bwd_preprocess(o_flat, do_flat)
+  D = flash_attention_bwd_preprocess(o, do)
 
   # 2. Compute dK, dV
-  dk_flat, dv_flat = flash_attention_bwd_dkv(
-    q_flat, k_flat, v_flat, d_flat, do_flat, lse_flat, scale, causal=causal)
+  dk, dv = flash_attention_bwd_dkv(
+    query, key, value, D, do, lse, scale, causal=causal)
   
   # 3. Compute dQ
-  dq_flat = flash_attention_bwd_dq(
-    q_flat, k_flat, v_flat, d_flat, do_flat, lse_flat, scale, causal=causal)
+  dq = flash_attention_bwd_dq(
+    query, key, value, D, do, lse, scale, causal=causal)
 
-  dq, dk, dv = jax.tree.map(
-    lambda t: t.reshape(bs, num_heads, seqlen, head_dim).transpose(0, 2, 1, 3), 
-    (dq_flat, dk_flat, dv_flat))
   return dq, dk, dv
 
 # Register vjp
