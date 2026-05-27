@@ -16,6 +16,8 @@ flags.DEFINE_string("impl", "pallas",
   "Attention implementation to benchmark: 'pallas', 'naive', or 'cudnn'.")
 flags.DEFINE_integer("head_dim", 64, 
   "Dimension of each attention head (64 or 128 recommended).")
+flags.DEFINE_bool("skip_correctness_check", False,
+  "Whether to skip the correctness check before benchmarking.")
 
 MAX_TOKENS = 16 * 1024
 
@@ -63,10 +65,11 @@ def main(argv):
     return jnp.sum(out)
   jit_fwd_fn = jax.jit(partial(attention_fn, causal=False))
   jit_fwd_bwd_fn = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
-  np.testing.assert_allclose(jit_fwd_fn(q, k, v), o_ref, rtol=1e-2, atol=1e-2)
-  jax.tree.map(lambda x, y: np.testing.assert_allclose(x, y, rtol=1e-2, atol=1e-2), 
-    jit_fwd_bwd_fn(q, k, v), (dq_ref, dk_ref, dv_ref))
-  print("Results match. Starting benchmark...")
+  if not FLAGS.skip_correctness_check:
+    np.testing.assert_allclose(jit_fwd_fn(q, k, v), o_ref, rtol=1e-2, atol=1e-2)
+    jax.tree.map(lambda x, y: np.testing.assert_allclose(x, y, rtol=1e-2, atol=1e-2), 
+      jit_fwd_bwd_fn(q, k, v), (dq_ref, dk_ref, dv_ref))
+    print("Results match. Starting benchmark...")
   print("Benchmarking attention implementation:", FLAGS.impl)
 
   for T in [1024, 2048, 4096, 8192, 16384]:
