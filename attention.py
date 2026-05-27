@@ -190,7 +190,7 @@ def flash_attention_fwd(
     interpret=True,
     compiler_params=plgpu.CompilerParams(
       num_warps=4,
-      num_stages=2
+      num_stages=3
     )
   )(query, key, value)
 
@@ -266,8 +266,8 @@ def flash_attention_bwd_dkv_kernel(
     dp = pl.dot(do, v.T)
     ds = p * (dp - d[:, None]) / scale
 
-    dv_acc += pl.dot(p.astype(do.dtype), do, trans_a=True)
-    dk_acc += pl.dot(ds.astype(q.dtype), q, trans_a=True)
+    dv_acc += pl.dot(p.T.astype(do.dtype), do)
+    dk_acc += pl.dot(ds.T.astype(q.dtype), q)
     return dk_acc, dv_acc
 
   dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
