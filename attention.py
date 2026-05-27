@@ -124,13 +124,14 @@ def flash_attention_fwd_kernel(
     k = plgpu.load(k_ref.at[idx, :])
     v = plgpu.load(v_ref.at[idx, :])
 
-    qk = pl.dot(q, k, trans_b=True) / scale
+    qk_scale = math.log2(math.e) / scale
+    qk = pl.dot(q, k, trans_b=True) * qk_scale
 
     m_curr = jnp.max(qk, axis=-1)
     m_next = jnp.maximum(m_prev, m_curr)
-    correction = jnp.exp(m_prev - m_next)
+    correction = jnp.exp2(m_prev - m_next)
 
-    s_curr = jnp.exp(qk - m_next[:, None])
+    s_curr = jnp.exp2(qk - m_next[:, None])
     l_curr = s_curr.sum(-1)
     l_next = correction * l_prev + l_curr
 
@@ -140,7 +141,7 @@ def flash_attention_fwd_kernel(
   
   o, m_i, l_i = jax.lax.fori_loop(0, num_k_blocks, body, (o, m_i, l_i))
   o /= l_i[:, None]
-  lse = m_i + jnp.log(l_i)
+  lse = m_i + jnp.log2(l_i)
 
   plgpu.store(o_ref, o.astype(o_ref.dtype))
   plgpu.store(lse_ref, lse.astype(lse_ref.dtype))
@@ -261,12 +262,13 @@ def flash_attention_bwd_dkv_kernel(
     lse = plgpu.load(lse_ref.at[0, idx])
     d = plgpu.load(d_ref.at[0, idx])
 
-    s = pl.dot(q, k, trans_b=True) / scale
+    qk_scale = math.log2(math.e) / scale
+    s = pl.dot(q, k, trans_b=True) * qk_scale
     if causal:
       q_pos = i * Br + jnp.arange(Br)
       mask = q_pos[:, None] >= k_pos[None, :]
       s = jnp.where(mask, s, -jnp.inf)
-    p = jnp.exp(s - lse[:, None])
+    p = jnp.exp2(s - lse[:, None])
 
     dp = pl.dot(do, v, trans_b=True)
     ds = p * (dp - d[:, None]) / scale
@@ -347,14 +349,15 @@ def flash_attention_bwd_dq_kernel(
     k = plgpu.load(k_ref.at[0, idx, :])
     v = plgpu.load(v_ref.at[0, idx, :])
     
-    s = pl.dot(q, k, trans_b=True) / scale
+    qk_scale = math.log2(math.e) / scale
+    s = pl.dot(q, k, trans_b=True) * qk_scale
 
     if causal:
       k_pos = i * Bc + jnp.arange(Bc)
       mask = q_pos[:, None] >= k_pos[None, :]
       s = jnp.where(mask, s, -jnp.inf)
 
-    p = jnp.exp(s - lse[:, None])
+    p = jnp.exp2(s - lse[:, None])
 
     dp = pl.dot(do, v, trans_b=True)
     ds = p * (dp - d[:, None]) / scale
