@@ -1,4 +1,5 @@
 """Dot-product Attention Kernels."""
+from dataclasses import dataclass
 from typing import Tuple
 from functools import partial
 import math
@@ -84,12 +85,16 @@ def cudnn_attention(
 # Pallas Kernels.
 # =================
 
+@dataclass(frozen=True)
+class KernelConfig:
+  block_q: int = 64
+  block_kv: int = 64
+  num_warps: int = 4
+  num_stages: int = 2
 
-# Forward Pass.
-# ==============
 
-Br = 64
-Bc = 64
+DEFAULT_FWD_CONFIG = KernelConfig(block_q=128, block_kv=64, num_warps=4, num_stages=3)
+DEFAULT_BWD_CONFIG = KernelConfig(block_q=64, block_kv=64, num_warps=4, num_stages=2)
 
 
 def flash_attention_fwd_kernel(
@@ -100,27 +105,20 @@ def flash_attention_fwd_kernel(
   lse_ref, 
   *, 
   scale: float,
-  num_k_blocks: int,
-  causal: bool = False):
-  """Forward pass kernel for flash attention.
-  
-  Args:
-    q_ref: Slice of query tensor of shape [Br, C].
-    k_ref: Slice of key tensor of shape [kv_length, C].
-    v_ref: Slice of value tensor of shape [kv_length, C].
-    o_ref: Output buffer of size [Br, C].
-    lse_ref: Log-sum-exp buffer of size [Br].
-    scale: Scaling factor for attention scores (usually sqrt of head dimension).
-
-  """
+  block_q: int,
+  block_kv: int,
+  causal: bool = False
+):
+  del causal
+  seq_len = k_ref.shape[0]
   q = plgpu.load(q_ref)
   o = jnp.zeros_like(q, dtype=jnp.float32)
-  m_i = jnp.full((Br,), -jnp.inf, dtype=jnp.float32)
-  l_i = jnp.zeros((Br,), dtype=jnp.float32)
+  m_i = jnp.zeros((block_q,), dtype=jnp.float32) - float("inf")
+  l_i = jnp.zeros((block_q,), dtype=jnp.float32)
 
   def body(i, carry):
     o_prev, m_prev, l_prev = carry
-    idx = pl.dslice(i * Bc, Bc)
+    idx = pl.dslice(i * block_kv, block_kv)
     k = plgpu.load(k_ref.at[idx, :])
     v = plgpu.load(v_ref.at[idx, :])
 
@@ -139,6 +137,7 @@ def flash_attention_fwd_kernel(
     o_next = correction[:, None] * o_prev + o_curr
     return (o_next, m_next, l_next)
   
+  num_k_blocks = pl.cdiv(seq_len, block_kv)
   o, m_i, l_i = jax.lax.fori_loop(0, num_k_blocks, body, (o, m_i, l_i))
   o /= l_i[:, None]
   lse = m_i + jnp.log2(l_i)
@@ -151,7 +150,8 @@ def flash_attention_fwd(
   query: jax.Array, 
   key: jax.Array, 
   value: jax.Array, 
-  causal: bool = False
+  causal: bool = False,
+  config: KernelConfig = DEFAULT_FWD_CONFIG,
 ) -> Tuple[jax.Array, jax.Array]:
   """Flash attention forward pass using Pallas.
   
@@ -166,31 +166,37 @@ def flash_attention_fwd(
   """
   bs, q_len, num_heads, head_dim = query.shape
   scale = math.sqrt(head_dim)
+  block_q = config.block_q
+  block_kv = config.block_kv
 
-  # Match mha.py program axis order: (q_tile, batch, head).
-  grid = (pl.cdiv(q_len, Br), bs, num_heads)
-  num_k_blocks = pl.cdiv(q_len, Bc)
+  grid = (pl.cdiv(q_len, block_q), bs, num_heads)
 
   out, lse = pl.pallas_call(
-    partial(flash_attention_fwd_kernel, scale=scale, num_k_blocks=num_k_blocks, causal=causal),
+    partial(
+      flash_attention_fwd_kernel,
+      scale=scale,
+      block_q=block_q,
+      block_kv=block_kv,
+      causal=causal,
+    ),
     out_shape=[
       jax.ShapeDtypeStruct(query.shape, query.dtype),
       jax.ShapeDtypeStruct((bs, num_heads, q_len), query.dtype)
     ],
     grid=grid,
     in_specs=[
-      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-      pl.BlockSpec((None, q_len, None, head_dim), lambda _, b, h: (b, 0, h, 0)),
-      pl.BlockSpec((None, q_len, None, head_dim), lambda _, b, h: (b, 0, h, 0))
+      pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, q_len, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
+      pl.BlockSpec((None, q_len, None, head_dim), lambda t, b, h: (b, 0, h, 0))
     ],
     out_specs=[
-      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-      pl.BlockSpec((None, None, Br), lambda t, b, h: (b, h, t))
+      pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, None, block_q), lambda t, b, h: (b, h, t))
     ],
     interpret=True,
     compiler_params=plgpu.CompilerParams(
-      num_warps=4,
-      num_stages=3
+      num_warps=config.num_warps,
+      num_stages=config.num_stages
     )
   )(query, key, value)
 
@@ -205,7 +211,7 @@ def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref):
   d = jnp.sum((o * do).astype(jnp.float32), axis=-1)
   plgpu.store(d_ref, d.astype(d_ref.dtype))
 
-def flash_attention_bwd_preprocess(o, do):
+def flash_attention_bwd_preprocess(o, do, config: KernelConfig = DEFAULT_BWD_CONFIG):
   """Computes `D = row_sum(O * dO)`.
 
   Args:
@@ -216,19 +222,23 @@ def flash_attention_bwd_preprocess(o, do):
     D of shape (bs, seqlen, num_heads)
   """
   bs, seqlen, num_heads, head_dim = o.shape
-  grid = (pl.cdiv(seqlen, Br), bs, num_heads)
+  block_q = config.block_q
+  grid = (pl.cdiv(seqlen, block_q), bs, num_heads)
 
   return pl.pallas_call(
     flash_attention_bwd_preprocess_kernel,
     out_shape=jax.ShapeDtypeStruct((bs, seqlen, num_heads), o.dtype),
     grid=grid,
     in_specs=[
-      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     ],
-    out_specs=pl.BlockSpec((None, Br, None), lambda t, b, h: (b, t, h)),
+    out_specs=pl.BlockSpec((None, block_q, None), lambda t, b, h: (b, t, h)),
     interpret=True,
-    compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2)
+    compiler_params=plgpu.CompilerParams(
+      num_warps=config.num_warps,
+      num_stages=config.num_stages,
+    )
   )(o, do)
 
 
@@ -241,9 +251,13 @@ def flash_attention_bwd_dkv_kernel(
   lse_ref,
   dk_ref,
   dv_ref,
-  num_q_blocks: int,
+  *,
+  block_q: int,
   scale: float, 
-  causal: bool):
+  causal: bool
+):
+  del causal
+  seq_len = q_ref.shape[0]
   k = plgpu.load(k_ref)
   v = plgpu.load(v_ref)
 
@@ -252,7 +266,7 @@ def flash_attention_bwd_dkv_kernel(
 
   def body(i, carry):
     dk_acc, dv_acc = carry
-    idx = pl.dslice(i * Br, Br)
+    idx = pl.dslice(i * block_q, block_q)
 
     q = plgpu.load(q_ref.at[idx, :])
     do = plgpu.load(do_ref.at[idx, :])
@@ -270,6 +284,7 @@ def flash_attention_bwd_dkv_kernel(
     dk_acc += pl.dot(ds.T.astype(q.dtype), q)
     return dk_acc, dv_acc
 
+  num_q_blocks = pl.cdiv(seq_len, block_q)
   dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
 
   plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
@@ -284,13 +299,20 @@ def flash_attention_bwd_dkv(
   lse: jax.Array,
   scale: float,
   causal: bool = False,
+  config: KernelConfig = DEFAULT_BWD_CONFIG,
 ) -> Tuple[jax.Array, jax.Array]:
   bs, seqlen, num_heads, head_dim = query.shape
-  num_q_blocks = pl.cdiv(seqlen, Br)
-  grid = (pl.cdiv(seqlen, Bc), bs, num_heads)
+  block_q = config.block_q
+  block_kv = config.block_kv
+  grid = (pl.cdiv(seqlen, block_kv), bs, num_heads)
 
   return pl.pallas_call(
-    partial(flash_attention_bwd_dkv_kernel, scale=scale, causal=causal, num_q_blocks=num_q_blocks),
+    partial(
+      flash_attention_bwd_dkv_kernel,
+      scale=scale,
+      block_q=block_q,
+      causal=causal,
+    ),
     out_shape=[
       jax.ShapeDtypeStruct(key.shape, key.dtype),
       jax.ShapeDtypeStruct(value.shape, value.dtype),
@@ -298,18 +320,21 @@ def flash_attention_bwd_dkv(
     grid=grid,
     in_specs=[
       pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
-      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_kv, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_kv, None, head_dim), lambda t, b, h: (b, t, h, 0)),
       pl.BlockSpec((None, seqlen, None), lambda t, b, h: (b, 0, h)),
       pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
       pl.BlockSpec((None, None, seqlen), lambda t, b, h: (b, h, 0)),
     ],
     out_specs=[
-      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-      pl.BlockSpec((None, Bc, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_kv, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_kv, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     ],
     interpret=True,
-    compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2)
+    compiler_params=plgpu.CompilerParams(
+      num_warps=config.num_warps,
+      num_stages=config.num_stages,
+    )
   )(query, key, value, d, do, lse)
 
 def flash_attention_bwd_dq_kernel(
@@ -320,10 +345,13 @@ def flash_attention_bwd_dq_kernel(
   do_ref,
   lse_ref,
   dq_ref,
+  *,
   scale: float,
+  block_kv: int,
   causal: bool,
-  num_kv_blocks: int,
 ):
+  del causal
+  seq_len = k_ref.shape[0]
   q = plgpu.load(q_ref)
   d = plgpu.load(d_ref)
   do = plgpu.load(do_ref)
@@ -333,7 +361,7 @@ def flash_attention_bwd_dq_kernel(
 
   def body(i, carry):
     dq_acc = carry
-    idx = pl.dslice(i * Bc, Bc)
+    idx = pl.dslice(i * block_kv, block_kv)
     k = plgpu.load(k_ref.at[idx, :])
     v = plgpu.load(v_ref.at[idx, :])
     
@@ -347,6 +375,7 @@ def flash_attention_bwd_dq_kernel(
     dq_acc += pl.dot(ds.astype(k.dtype), k)
     return dq_acc
   
+  num_kv_blocks = pl.cdiv(seq_len, block_kv)
   dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
   plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
@@ -359,26 +388,36 @@ def flash_attention_bwd_dq(
   lse: jax.Array,
   scale: float,
   causal: bool = False,
+  config: KernelConfig = DEFAULT_BWD_CONFIG,
 ) -> jax.Array:
   bs, seqlen, num_heads, head_dim = query.shape
-  num_kv_blocks = pl.cdiv(seqlen, Bc)
-  grid = (pl.cdiv(seqlen, Br), bs, num_heads)
+  block_q = config.block_q
+  block_kv = config.block_kv
+  grid = (pl.cdiv(seqlen, block_q), bs, num_heads)
 
   return pl.pallas_call(
-    partial(flash_attention_bwd_dq_kernel, scale=scale, causal=causal, num_kv_blocks=num_kv_blocks),
+    partial(
+      flash_attention_bwd_dq_kernel,
+      scale=scale,
+      causal=causal,
+      block_kv=block_kv,
+    ),
     out_shape=jax.ShapeDtypeStruct(query.shape, query.dtype),
     grid=grid,
     in_specs=[
-      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
       pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
       pl.BlockSpec((None, seqlen, None, head_dim), lambda t, b, h: (b, 0, h, 0)),
-      pl.BlockSpec((None, Br, None), lambda t, b, h: (b, t, h)),
-      pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-      pl.BlockSpec((None, None, Br), lambda t, b, h: (b, h, t)),
+      pl.BlockSpec((None, block_q, None), lambda t, b, h: (b, t, h)),
+      pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+      pl.BlockSpec((None, None, block_q), lambda t, b, h: (b, h, t)),
     ],
-    out_specs=pl.BlockSpec((None, Br, None, head_dim), lambda t, b, h: (b, t, h, 0)),
+    out_specs=pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     interpret=True,
-    compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
+    compiler_params=plgpu.CompilerParams(
+      num_warps=config.num_warps,
+      num_stages=config.num_stages,
+    ),
   )(query, key, value, d, do, lse)
 
 def flash_attention_bwd(
@@ -389,6 +428,7 @@ def flash_attention_bwd(
   lse: jax.Array,
   do: jax.Array,
   causal: bool = False,
+  config: KernelConfig = DEFAULT_BWD_CONFIG,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
   """Flash Attention Backward pass in Pallas.
   
@@ -408,44 +448,45 @@ def flash_attention_bwd(
   scale = math.sqrt(head_dim)
 
   # 1. Preprocess: D = row_sum(O * dO)
-  D = flash_attention_bwd_preprocess(o, do)
+  D = flash_attention_bwd_preprocess(o, do, config=config)
 
   # 2. Compute dK, dV
   dk, dv = flash_attention_bwd_dkv(
-    query, key, value, D, do, lse, scale, causal=causal)
+    query, key, value, D, do, lse, scale, causal=causal, config=config)
   
   # 3. Compute dQ
   dq = flash_attention_bwd_dq(
-    query, key, value, D, do, lse, scale, causal=causal)
+    query, key, value, D, do, lse, scale, causal=causal, config=config)
 
   return dq, dk, dv
+
+
+def make_flash_attention(
+  *,
+  fwd_config: KernelConfig = DEFAULT_FWD_CONFIG,
+  bwd_config: KernelConfig = DEFAULT_BWD_CONFIG,
+):
+  @partial(jax.custom_vjp, nondiff_argnums=(3,))
+  def flash_attention_impl(
+    query: jax.Array, key: jax.Array, value: jax.Array, causal: bool = False
+  ) -> jax.Array:
+    o, _ = flash_attention_fwd(query, key, value, causal=causal, config=fwd_config)
+    return o
+
+  def flash_attention_fwd_rule(query, key, value, causal):
+    o, lse = flash_attention_fwd(query, key, value, causal=causal, config=fwd_config)
+    return o, (query, key, value, o, lse)
+
+  def flash_attention_bwd_rule(causal, res, g):
+    query, key, value, o, lse = res
+    dq, dk, dv = flash_attention_bwd(
+      query, key, value, o, lse, g, causal=causal, config=bwd_config
+    )
+    return dq, dk, dv
+
+  flash_attention_impl.defvjp(flash_attention_fwd_rule, flash_attention_bwd_rule)
+  return flash_attention_impl
 
 # Register vjp
 # ============
-@partial(jax.custom_vjp, nondiff_argnums=(3,))
-def flash_attention(
-  query: jax.Array, key: jax.Array, value: jax.Array, causal: bool = False) -> jax.Array:
-  """Flash attention using Pallas.
-  
-  Args:
-    query: jax.Array of shape (batch..., q_length, num_heads, depth) and bf16/f16 dtype.
-    key: jax.Array of shape (batch..., kv_length, num_heads, depth) and bf16/f16 dtype.
-    value: jax.Array of shape (batch..., kv_length, num_heads, depth) and bf16/f16 dtype.
-    causal: bool, whether to apply causal masking.
-  
-  Returns:
-    jax.Array of shape (batch..., q_length, num_heads, depth).
-  """
-  o, _ = flash_attention_fwd(query, key, value, causal=causal)
-  return o
-
-def flash_attention_fwd_rule(query, key, value, causal):
-  o, lse = flash_attention_fwd(query, key, value, causal=causal)
-  return o, (query, key, value, o, lse)
-
-def flash_attention_bwd_rule(causal, res, g):
-  query, key, value, o, lse = res
-  dq, dk, dv = flash_attention_bwd(query, key, value, o, lse, g, causal=causal)
-  return dq, dk, dv
-
-flash_attention.defvjp(flash_attention_fwd_rule, flash_attention_bwd_rule)
+flash_attention = make_flash_attention()
