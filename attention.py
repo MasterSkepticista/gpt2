@@ -1,4 +1,5 @@
 """Dot-product Attention Kernels."""
+import os
 from dataclasses import dataclass
 from typing import Tuple
 from functools import partial
@@ -84,6 +85,8 @@ def cudnn_attention(
 
 # Pallas Kernels.
 # =================
+
+INTERPRET_MODE = os.environ.get("INTERPRET_MODE", "0") == "1"
 
 @dataclass(frozen=True)
 class KernelConfig:
@@ -193,7 +196,7 @@ def flash_attention_fwd(
       pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
       pl.BlockSpec((None, None, block_q), lambda t, b, h: (b, h, t))
     ],
-    interpret=True,
+    interpret=INTERPRET_MODE,
     compiler_params=plgpu.CompilerParams(
       num_warps=config.num_warps,
       num_stages=config.num_stages
@@ -234,7 +237,7 @@ def flash_attention_bwd_preprocess(o, do, config: KernelConfig = DEFAULT_BWD_CON
       pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     ],
     out_specs=pl.BlockSpec((None, block_q, None), lambda t, b, h: (b, t, h)),
-    interpret=True,
+    interpret=INTERPRET_MODE,
     compiler_params=plgpu.CompilerParams(
       num_warps=config.num_warps,
       num_stages=config.num_stages,
@@ -330,7 +333,7 @@ def flash_attention_bwd_dkv(
       pl.BlockSpec((None, block_kv, None, head_dim), lambda t, b, h: (b, t, h, 0)),
       pl.BlockSpec((None, block_kv, None, head_dim), lambda t, b, h: (b, t, h, 0)),
     ],
-    interpret=True,
+    interpret=INTERPRET_MODE,
     compiler_params=plgpu.CompilerParams(
       num_warps=config.num_warps,
       num_stages=config.num_stages,
@@ -413,7 +416,7 @@ def flash_attention_bwd_dq(
       pl.BlockSpec((None, None, block_q), lambda t, b, h: (b, h, t)),
     ],
     out_specs=pl.BlockSpec((None, block_q, None, head_dim), lambda t, b, h: (b, t, h, 0)),
-    interpret=True,
+    interpret=INTERPRET_MODE,
     compiler_params=plgpu.CompilerParams(
       num_warps=config.num_warps,
       num_stages=config.num_stages,
