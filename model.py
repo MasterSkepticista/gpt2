@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from utils import recover_tree
+from attention import flash_attention, naive_attention, cudnn_attention
 
 
 class SelfAttention(nn.Module):
@@ -22,7 +23,7 @@ class SelfAttention(nn.Module):
   """
   num_heads: int
   proj_kernel_init: Callable[..., Any]
-  implementation: Literal["xla", "cudnn"] = "xla"
+  implementation: Literal["xla", "cudnn", "pallas"] = "xla"
   kernel_init: Callable[..., Any] = nn.initializers.normal(0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
@@ -49,8 +50,12 @@ class SelfAttention(nn.Module):
     q, k, v = jax.tree.map(
       lambda t: t.reshape(bs, -1, self.num_heads, head_dim), (q, k, v))
 
-    x = jax.nn.dot_product_attention(
-        q, k, v, is_causal=True, implementation=self.implementation)
+    if self.implementation == "cudnn":
+      x = cudnn_attention(q, k, v, causal=True)
+    elif self.implementation == "pallas":
+      x = flash_attention(q, k, v, causal=True)
+    else:
+      x = naive_attention(q, k, v, causal=True)
 
     out = nn.DenseGeneral(
         features=features,
@@ -87,7 +92,7 @@ class Block(nn.Module):
   """Transformer block."""
   emb_dim: int
   num_heads: int
-  sdpa_implementation: Literal["xla", "cudnn"]
+  sdpa_implementation: Literal["xla", "cudnn", "pallas"]
   residual_kernel_init: nn.initializers.Initializer
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
@@ -158,7 +163,7 @@ class GPT(nn.Module):
   emb_dim: int
   num_heads: int
   num_layers: int
-  sdpa_implementation: Literal["xla", "cudnn"] = "xla"
+  sdpa_implementation: Literal["xla", "cudnn", "pallas"]
   embedding_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros

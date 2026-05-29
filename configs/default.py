@@ -28,7 +28,12 @@ def get_config():
   # Model
   _set_model(config, "gpt2")
   config.model.dtype = "bfloat16"  # Precision of computation.
-  config.model.sdpa_implementation = "cudnn"  # "xla" or "cudnn".
+
+  # "pallas", "cudnn" or "xla". 
+  # xla: naive O(N^2) implementation, works on all platforms.
+  # cudnn: uses jax.nn.dot_product_attention with cudnn backend (it is flash_attn).
+  # pallas: uses custom pallas kernel that implements flash attn..
+  config.model.sdpa_implementation = "xla"
 
   # Optimizer
   config.lr = 6e-4
@@ -39,7 +44,7 @@ def get_config():
   config.optax_kwargs = dict(b1=0.9, b2=0.95, weight_decay=0.1)
 
   # Training
-  config.batch_size = 512  # Corresponds to 512 * config.model.block_size tokens per batch.
+  config.batch_size = 16  # Corresponds to 512 * config.model.block_size tokens per batch.
   config.grad_accum_steps = 1  # Increment in orders of 2 if facing OOM.
   config.log_train_steps = 50
   config.log_eval_steps = 500  # Also checkpoints the model.
