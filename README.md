@@ -13,8 +13,11 @@ Updates:
 - [x] Fix large gradient norm spikes for longer training runs.
 - [x] Test `accumulate_gradient`.
 - [x] Update docstrings.
-- [ ] Add `shard_map` support for model and data sharding.
-- [ ] KV cache decoding.
+
+New (Pallas FAv2):
+- [x] Implementation
+- [ ] Causal Masking
+
 ### Setup
 Create a virtual environment and install packages.
 ```shell

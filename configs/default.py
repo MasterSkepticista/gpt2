@@ -32,7 +32,8 @@ def get_config():
   # "pallas", "cudnn" or "xla". 
   # xla: naive O(N^2) implementation, works on all platforms.
   # cudnn: uses jax.nn.dot_product_attention with cudnn backend (it is flash_attn).
-  # pallas: uses custom pallas kernel that implements flash attn..
+  # pallas: uses custom pallas kernel that implements flash attn. Do not use,
+  # since it does not support causal masking yet.
   config.model.sdpa_implementation = "xla"
 
   # Optimizer
