@@ -3,5 +3,5 @@ clu
 optax
 tiktoken
 tensorflow
-jax[cuda12]==0.10.0
+jax[cuda13]==0.11.0
 datasets
