@@ -54,5 +54,17 @@ mpirun -n 8 \
 ```
 <img src="https://github.com/MasterSkepticista/gpt2/raw/main/.github/loss.jpg">
 
+### Generating Text
+Weights are downloaded from the HF Hub and serialized into workdir for subsequent reuse.
+Install two packages:
+```shell
+pip install torch transformers
+```
+
+Run inference:
+```shell
+python inference.py --workdir artifacts/temp --prompt "The IEEE-754 standard describes"
+```
+
 ### License
 MIT
