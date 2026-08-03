@@ -159,7 +159,7 @@ class GPT(nn.Module):
   emb_dim: int
   num_heads: int
   num_layers: int
-  sdpa_implementation: str
+  sdpa_implementation: str = None
   embedding_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
