@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from utils import recover_tree
-from attention import flash_attention, naive_attention, cudnn_attention
 
 
 class SelfAttention(nn.Module):
@@ -16,14 +15,14 @@ class SelfAttention(nn.Module):
     num_heads: Number of attention heads.
     proj_kernel_init: Initializer for residual stream projection.
     implementation: Attention implementation. `cudnn` will use flash attention only 
-      on supported GPUs. Defaults to `xla`.
+      on supported GPUs. `None` means fallback to `xla`.
     kernel_init: Initializer for qkv projection.
     bias_init: Initializer for qkv biases.
     dtype: DType of the computation (default: float32).
   """
   num_heads: int
   proj_kernel_init: Callable[..., Any]
-  implementation: Literal["xla", "cudnn", "pallas"] = "xla"
+  implementation: str = None
   kernel_init: Callable[..., Any] = nn.initializers.normal(0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
   dtype: jnp.dtype = jnp.float32
@@ -50,12 +49,8 @@ class SelfAttention(nn.Module):
     q, k, v = jax.tree.map(
       lambda t: t.reshape(bs, -1, self.num_heads, head_dim), (q, k, v))
 
-    if self.implementation == "cudnn":
-      x = cudnn_attention(q, k, v, causal=True)
-    elif self.implementation == "pallas":
-      x = flash_attention(q, k, v, causal=True)
-    else:
-      x = naive_attention(q, k, v, causal=True)
+    x = jax.nn.dot_product_attention(
+        q, k, v, is_causal=True, implementation=self.implementation)
 
     out = nn.DenseGeneral(
         features=features,
@@ -92,7 +87,7 @@ class Block(nn.Module):
   """Transformer block."""
   emb_dim: int
   num_heads: int
-  sdpa_implementation: Literal["xla", "cudnn", "pallas"]
+  sdpa_implementation: str
   residual_kernel_init: nn.initializers.Initializer
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
@@ -163,7 +158,7 @@ class GPT(nn.Module):
   emb_dim: int
   num_heads: int
   num_layers: int
-  sdpa_implementation: Literal["xla", "cudnn", "pallas"]
+  sdpa_implementation: str
   embedding_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   kernel_init: Callable[..., Any] = nn.initializers.normal(stddev=0.02)
   bias_init: Callable[..., Any] = nn.initializers.zeros
