@@ -1,6 +1,6 @@
 """Model definition for GPT-2."""
 import functools
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -46,15 +46,16 @@ class SelfAttention(nn.Module):
     
     # Project to q/k/v and multi-heads.
     q, k, v = jnp.split(dense(x), 3, axis=-1)
+
     q, k, v = jax.tree.map(
       lambda t: t.reshape(bs, -1, self.num_heads, head_dim), (q, k, v))
-
     x = jax.nn.dot_product_attention(
         q, k, v, is_causal=True, implementation=self.implementation)
+    x = x.reshape(bs, seqlen, features)
 
     out = nn.DenseGeneral(
         features=features,
-        axis=(-2, -1),
+        axis=-1,
         kernel_init=self.proj_kernel_init,
         bias_init=self.bias_init,
         dtype=self.dtype,
